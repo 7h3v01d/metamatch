@@ -83,7 +83,12 @@ class VideoFile:
 
 def _guess_title_year_from_filename(filename: str) -> tuple[Optional[str], Optional[str]]:
     stem, _ = os.path.splitext(filename)
-    working = stem.replace(".", " ").replace("_", " ")
+
+    # Strip junk tokens first, while dots are still intact - some tokens
+    # rely on a literal dot (h.264, 5.1) that a later dot->space pass would
+    # otherwise split apart before the junk regex ever sees them.
+    working = _JUNK_RE.sub(" ", stem)
+    working = working.replace(".", " ").replace("_", " ")
     working = re.sub(r"\s+", " ", working).strip()
 
     year = None
@@ -94,7 +99,8 @@ def _guess_title_year_from_filename(filename: str) -> tuple[Optional[str], Optio
         year = year_match.group(1)
         title_part = working[:year_match.start()]
 
-    # Strip a trailing "-GROUP" release-tag if present before removing other junk
+    # Strip a trailing "-GROUP" release-tag if present, then sweep for any
+    # remaining junk tokens that only became isolated after the dot/underscore pass.
     title_part = _TRAILING_GROUP_RE.sub("", title_part)
     title_part = _JUNK_RE.sub(" ", title_part)
     title_part = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", title_part)

@@ -127,6 +127,9 @@ metamatch/
   static/style.css         UI styling
   static/app.js               Frontend logic (fetch calls, rendering)
   requirements.txt
+  requirements-dev.txt   Adds pytest for running the test suite
+  pytest.ini
+  tests/                  See "Running the tests" below
 ```
 
 ## Movie matching (TMDB)
@@ -181,3 +184,49 @@ they're organized are different:
   for `.mkv`/`.avi`/`.mov`/`.wmv` the embed goes through an `ffmpeg`
   remux that isn't cheaply reversible, so those tags are left as-is on
   undo - the same tradeoff as music's cover-art embedding.
+
+## Running the tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+157 tests covering both the music and movie sides: filename/tag parsing,
+match-scoring math, tag writing and cover-art/poster embedding, renaming,
+undo (including the "don't delete a sidecar that already existed"
+edge case), duplicate detection and quarantine, TMDB key storage, and
+the full Flask route layer for both `/api/*` and `/api/movies/*`.
+
+None of it touches the network — MusicBrainz, TMDB, and Cover Art
+Archive/poster lookups are all monkeypatched with fixtures in
+`tests/conftest.py` (`mock_music_match`, `mock_movie_match`,
+`mock_cover_art`, `mock_poster_download`), so the suite runs offline,
+fast (~4s), and without needing a TMDB API key.
+
+Real media files (mp3/wma/flac/mp4/mkv) are generated once per test
+session with `ffmpeg` and copied fresh into each test via the
+`music_dir`/`movie_dir` fixtures, so tag-writing and `ffprobe` reads are
+exercised against actual files, not mocks. Tests that need `ffmpeg` are
+marked `@requires_ffmpeg` and skip cleanly (rather than fail) if it isn't
+installed — run `pytest -v` to see which ones were skipped and why.
+
+Config-touching tests use the `isolated_config` fixture, which redirects
+`core/config.py` to a temp directory for the duration of the test, so
+the suite never reads or writes your real `~/.metamatch/config.json`.
+
+```
+tests/
+  conftest.py           Fixtures: media generation, mocks, app state reset
+  test_scanner.py         Music filename parsing + tag reading
+  test_matcher.py           MusicBrainz scoring math
+  test_tagger.py               Tag writing, cover art, rename, undo helpers
+  test_art.py                    Cover Art Archive fetch + cache
+  test_dedup.py                    Exact/probable duplicates, quarantine (both)
+  test_video_scanner.py    Movie filename parsing + ffprobe reading
+  test_movie_matcher.py      TMDB scoring math
+  test_movie_tagger.py         Rename, .nfo, poster, embedded metadata
+  test_config.py                 TMDB key storage
+  test_app_music.py              Music Flask routes, end to end
+  test_app_movies.py               Movie Flask routes, end to end
+```
