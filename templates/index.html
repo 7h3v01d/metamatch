@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MetaMatch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="reel-bg" aria-hidden="true">
+  <svg viewBox="0 0 200 200" class="reel reel-a"><circle cx="100" cy="100" r="96" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="100" cy="100" r="70" fill="none" stroke="currentColor" stroke-width="1"/><circle cx="100" cy="100" r="14" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+  <svg viewBox="0 0 200 200" class="reel reel-b"><circle cx="100" cy="100" r="96" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="100" cy="100" r="70" fill="none" stroke="currentColor" stroke-width="1"/><circle cx="100" cy="100" r="14" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+</div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">MM</span>
+    <div class="brand-text">
+      <h1>METAMATCH</h1>
+      <p>local library &middot; metadata reconciliation</p>
+    </div>
+  </div>
+  <div class="counter" id="fileCounter">
+    <span class="counter-label">TRACKS</span>
+    <span class="counter-value" id="counterValue">000</span>
+  </div>
+</header>
+
+<main>
+
+  <section class="panel control-panel">
+    <div class="field-row">
+      <label for="folderInput">Folder to scan</label>
+      <div class="input-with-button">
+        <input type="text" id="folderInput" placeholder="/path/to/your/music" autocomplete="off">
+        <button id="scanBtn" class="btn btn-primary">Scan folder</button>
+      </div>
+      <label class="checkbox-field">
+        <input type="checkbox" id="recursiveCheck" checked>
+        <span>Include subfolders</span>
+      </label>
+    </div>
+    <p class="status-line" id="scanStatus">Point MetaMatch at a folder of mp3 / wma / flac / m4a / ogg files to begin.</p>
+  </section>
+
+  <section class="panel action-panel" id="actionPanel" hidden>
+    <div class="action-row">
+      <button id="matchBtn" class="btn btn-accent">Find matches</button>
+      <div class="progress-wrap" id="progressWrap" hidden>
+        <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+        <span class="progress-label" id="progressLabel">0 / 0</span>
+      </div>
+    </div>
+
+    <div class="action-row apply-row" id="applyRow" hidden>
+      <div class="threshold-field">
+        <label for="thresholdInput">Auto-apply threshold</label>
+        <input type="range" id="thresholdInput" min="0" max="100" value="80">
+        <span id="thresholdValue">80%</span>
+      </div>
+      <label class="checkbox-field"><input type="checkbox" id="applyTagCheck" checked><span>Write tags</span></label>
+      <label class="checkbox-field"><input type="checkbox" id="applyRenameCheck" checked><span>Rename files</span></label>
+      <button id="applyAllBtn" class="btn btn-primary">Apply to matches ≥ threshold</button>
+      <button id="exportBtn" class="btn btn-ghost">Export CSV report</button>
+    </div>
+  </section>
+
+  <section class="panel table-panel" id="tablePanel" hidden>
+    <div class="table-scroll">
+      <table id="trackTable">
+        <thead>
+          <tr>
+            <th class="col-file">File</th>
+            <th class="col-current">Current tags</th>
+            <th class="col-match">Best match</th>
+            <th class="col-confidence">Confidence</th>
+            <th class="col-actions">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="trackTableBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
