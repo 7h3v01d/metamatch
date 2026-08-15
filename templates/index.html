@@ -24,12 +24,19 @@
     </div>
   </div>
   <div class="counter" id="fileCounter">
-    <span class="counter-label">TRACKS</span>
+    <span class="counter-label" id="counterLabel">TRACKS</span>
     <span class="counter-value" id="counterValue">000</span>
   </div>
 </header>
 
+<nav class="tabs">
+  <button class="tab-btn active" id="tabMusicBtn" data-view="music">Music</button>
+  <button class="tab-btn" id="tabMoviesBtn" data-view="movies">Movies</button>
+</nav>
+
 <main>
+
+<div id="musicView">
 
   <section class="panel control-panel">
     <div class="field-row">
@@ -63,9 +70,22 @@
       </div>
       <label class="checkbox-field"><input type="checkbox" id="applyTagCheck" checked><span>Write tags</span></label>
       <label class="checkbox-field"><input type="checkbox" id="applyRenameCheck" checked><span>Rename files</span></label>
+      <label class="checkbox-field"><input type="checkbox" id="applyArtCheck"><span>Embed cover art</span></label>
       <button id="applyAllBtn" class="btn btn-primary">Apply to matches ≥ threshold</button>
+      <button id="undoAllBtn" class="btn btn-ghost">Undo all applied</button>
       <button id="exportBtn" class="btn btn-ghost">Export CSV report</button>
     </div>
+  </section>
+
+  <section class="panel dedup-panel" id="dedupPanel" hidden>
+    <div class="action-row">
+      <div class="panel-heading">
+        <h2>Duplicates</h2>
+        <p>Find identical files and probable repeat rips of the same recording.</p>
+      </div>
+      <button id="scanDupesBtn" class="btn btn-accent">Scan for duplicates</button>
+    </div>
+    <div id="dedupResults"></div>
   </section>
 
   <section class="panel table-panel" id="tablePanel" hidden>
@@ -84,6 +104,94 @@
       </table>
     </div>
   </section>
+
+</div>
+
+<div id="moviesView" hidden>
+
+  <section class="panel settings-panel" id="tmdbSettingsPanel" hidden>
+    <div class="panel-heading">
+      <h2>TMDB API key required</h2>
+      <p>Movie matching uses The Movie Database. Get a free key at
+        <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">themoviedb.org/settings/api</a>,
+        then paste it below.</p>
+    </div>
+    <div class="input-with-button" style="margin-top:14px;">
+      <input type="text" id="tmdbKeyInput" placeholder="Paste your TMDB API key" autocomplete="off">
+      <button id="saveTmdbKeyBtn" class="btn btn-primary">Save key</button>
+    </div>
+    <p class="status-line" id="tmdbStatus"></p>
+  </section>
+
+  <section class="panel control-panel">
+    <div class="field-row">
+      <label for="movieFolderInput">Folder to scan</label>
+      <div class="input-with-button">
+        <input type="text" id="movieFolderInput" placeholder="/path/to/your/movies" autocomplete="off">
+        <button id="movieScanBtn" class="btn btn-primary">Scan folder</button>
+      </div>
+      <label class="checkbox-field">
+        <input type="checkbox" id="movieRecursiveCheck" checked>
+        <span>Include subfolders</span>
+      </label>
+    </div>
+    <p class="status-line" id="movieScanStatus">Point MetaMatch at a folder of mp4 / mkv / avi / mov / wmv files to begin.</p>
+  </section>
+
+  <section class="panel action-panel" id="movieActionPanel" hidden>
+    <div class="action-row">
+      <button id="movieMatchBtn" class="btn btn-accent">Find matches</button>
+      <div class="progress-wrap" id="movieProgressWrap" hidden>
+        <div class="progress-track"><div class="progress-fill" id="movieProgressFill"></div></div>
+        <span class="progress-label" id="movieProgressLabel">0 / 0</span>
+      </div>
+    </div>
+
+    <div class="action-row apply-row" id="movieApplyRow" hidden>
+      <div class="threshold-field">
+        <label for="movieThresholdInput">Auto-apply threshold</label>
+        <input type="range" id="movieThresholdInput" min="0" max="100" value="80">
+        <span id="movieThresholdValue">80%</span>
+      </div>
+      <label class="checkbox-field"><input type="checkbox" id="movieRenameCheck" checked><span>Rename files</span></label>
+      <label class="checkbox-field"><input type="checkbox" id="movieNfoCheck" checked><span>Write .nfo</span></label>
+      <label class="checkbox-field"><input type="checkbox" id="moviePosterCheck" checked><span>Save poster</span></label>
+      <label class="checkbox-field"><input type="checkbox" id="movieTagCheck"><span>Embed metadata (slower)</span></label>
+      <button id="movieApplyAllBtn" class="btn btn-primary">Apply to matches ≥ threshold</button>
+      <button id="movieUndoAllBtn" class="btn btn-ghost">Undo all applied</button>
+      <button id="movieExportBtn" class="btn btn-ghost">Export CSV report</button>
+    </div>
+  </section>
+
+  <section class="panel dedup-panel" id="movieDedupPanel" hidden>
+    <div class="action-row">
+      <div class="panel-heading">
+        <h2>Duplicates</h2>
+        <p>Find identical files and probable repeat rips of the same movie.</p>
+      </div>
+      <button id="movieScanDupesBtn" class="btn btn-accent">Scan for duplicates</button>
+    </div>
+    <div id="movieDedupResults"></div>
+  </section>
+
+  <section class="panel table-panel" id="movieTablePanel" hidden>
+    <div class="table-scroll">
+      <table id="movieTable">
+        <thead>
+          <tr>
+            <th class="col-file">File</th>
+            <th class="col-current">Parsed</th>
+            <th class="col-match">Best match</th>
+            <th class="col-confidence">Confidence</th>
+            <th class="col-actions">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="movieTableBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+</div>
 
 </main>
 

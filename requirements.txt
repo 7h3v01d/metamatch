@@ -2,3 +2,7 @@ flask>=3.0.0
 mutagen>=1.47.0
 requests>=2.31.0
 rapidfuzz>=3.6.0
+
+# Movie matching also needs ffmpeg/ffprobe on your system PATH (not a pip
+# package). On macOS: brew install ffmpeg. On Ubuntu/Debian: apt install
+# ffmpeg. On Windows: https://ffmpeg.org/download.html

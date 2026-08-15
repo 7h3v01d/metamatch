@@ -96,6 +96,7 @@ def score_candidate(track, recording: dict) -> dict:
     release = _best_release(recording)
     cand_album = release.get("title") if release else None
     cand_date = release.get("date") if release else None
+    cand_release_id = release.get("id") if release else None
 
     title_sim = fuzz.token_sort_ratio(query_title, cand_title) if query_title and cand_title else 0
     artist_sim = fuzz.token_sort_ratio(query_artist, cand_artist) if query_artist and cand_artist else None
@@ -127,6 +128,7 @@ def score_candidate(track, recording: dict) -> dict:
 
     return {
         "recording_id": recording.get("id"),
+        "release_id": cand_release_id,
         "title": cand_title,
         "artist": cand_artist,
         "album": cand_album,

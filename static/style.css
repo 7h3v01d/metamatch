@@ -60,6 +60,35 @@ body {
 
 main, header { position: relative; z-index: 1; }
 
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 40px;
+  border-bottom: 1px solid var(--border-soft);
+  position: relative;
+  z-index: 1;
+}
+.tab-btn {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 13.5px;
+  padding: 14px 6px;
+  margin-bottom: -1px;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+}
+.tab-btn + .tab-btn { margin-left: 18px; }
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--amber); border-bottom-color: var(--amber); }
+
+.settings-panel a { color: var(--teal); }
+
+.poster-thumb { width: 40px; height: 58px; object-fit: cover; }
+
 /* ---------------------------------------------------------------------- */
 
 .topbar {
@@ -243,6 +272,53 @@ input[type="text"]::placeholder { color: var(--text-faint); }
 
 /* ---------------------------------------------------------------------- */
 
+.panel-heading h2 {
+  margin: 0 0 2px;
+  font-size: 15px;
+  letter-spacing: 0.03em;
+}
+.panel-heading p {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.dedup-panel .action-row { justify-content: space-between; }
+.dedup-panel #dedupResults { margin-top: 4px; }
+
+.dupe-groups { display: flex; flex-direction: column; gap: 16px; }
+.dupe-group {
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 14px 16px;
+  background: var(--panel-raised);
+}
+.dupe-group-label {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--amber);
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+.dupe-count { color: var(--text-faint); text-transform: none; letter-spacing: 0; }
+
+.dupe-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  cursor: pointer;
+  border-top: 1px solid var(--border-soft);
+}
+.dupe-row:first-of-type { border-top: none; }
+.dupe-row input { accent-color: var(--red); width: 15px; height: 15px; flex-shrink: 0; }
+.dupe-name { font-size: 13px; word-break: break-word; }
+.dupe-meta { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-faint); margin-left: auto; white-space: nowrap; padding-left: 12px; }
+
+/* ---------------------------------------------------------------------- */
+
 .table-panel { padding: 0; overflow: hidden; }
 .table-scroll { overflow-x: auto; }
 
@@ -275,6 +351,17 @@ td { padding: 14px 18px; vertical-align: top; }
 .tag-line .missing { color: var(--text-faint); font-style: italic; }
 .tag-line strong { color: var(--text); font-weight: 500; }
 
+.match-row { display: flex; gap: 10px; align-items: flex-start; }
+.match-thumb {
+  width: 40px; height: 40px;
+  border-radius: 4px;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--bg);
+}
+.match-thumb-empty { background: var(--bg); }
+.match-text { min-width: 0; }
 .match-artist { font-weight: 600; }
 .match-title { color: var(--text-muted); font-size: 12.5px; }
 .match-album { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-faint); margin-top: 3px; }
