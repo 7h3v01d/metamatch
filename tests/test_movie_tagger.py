@@ -4,7 +4,7 @@ import subprocess
 
 import pytest
 
-from core.movie_tagger import (
+from metamatch.movie_tagger import (
     sanitize_filename,
     rename_to_match,
     write_nfo,
@@ -82,7 +82,7 @@ class TestDownloadPoster:
         assert download_poster(str(video_path), {"title": "No Poster"}) is None
 
     def test_saves_poster_bytes(self, tmp_path, monkeypatch):
-        import core.movie_tagger as movie_tagger_module
+        import metamatch.movie_tagger as movie_tagger_module
 
         class FakeResponse:
             content = b"POSTERBYTES"
@@ -97,7 +97,7 @@ class TestDownloadPoster:
         assert open(dest, "rb").read() == b"POSTERBYTES"
 
     def test_returns_none_on_network_error(self, tmp_path, monkeypatch):
-        import core.movie_tagger as movie_tagger_module
+        import metamatch.movie_tagger as movie_tagger_module
         import requests
 
         def fake_get(*a, **k):

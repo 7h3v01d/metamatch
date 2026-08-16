@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metamatch"
+version = "0.2.0"
+description = "Match local music/movie files against MusicBrainz/TMDB and reconcile tags, filenames, cover art, and duplicates."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "mutagen>=1.47.0",
+    "rapidfuzz>=3.6.0",
+]
+
+[project.optional-dependencies]
+webapp = ["flask>=3.0.0"]
+dev = ["pytest>=8.0.0"]
+
+[tool.setuptools.packages.find]
+include = ["metamatch*"]

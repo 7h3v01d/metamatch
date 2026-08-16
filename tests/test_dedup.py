@@ -2,9 +2,9 @@ import os
 
 import pytest
 
-from core import dedup
-from core.scanner import TrackFile
-from core.video_scanner import VideoFile
+from metamatch import dedup
+from metamatch.scanner import TrackFile
+from metamatch.video_scanner import VideoFile
 
 
 def make_track(path, **overrides):

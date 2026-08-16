@@ -24,9 +24,9 @@ class TestScanRoute:
     def test_scan_resets_undo_state(self, app_client, music_dir):
         app_client.post("/api/scan", json={"folder": str(music_dir)})
         import app as app_module
-        app_module.STATE["undo_by_path"]["stale"] = {"fake": "record"}
+        app_module.music_library.undo_by_path["stale"] = {"fake": "record"}
         app_client.post("/api/scan", json={"folder": str(music_dir)})
-        assert app_module.STATE["undo_by_path"] == {}
+        assert app_module.music_library.undo_by_path == {}
 
 
 @requires_ffmpeg
@@ -47,7 +47,7 @@ class TestMatchFlow:
     def test_cannot_start_match_twice_concurrently(self, app_client, music_dir, mock_music_match):
         app_client.post("/api/scan", json={"folder": str(music_dir)})
         import app as app_module
-        app_module.STATE["match_progress"]["running"] = True
+        app_module.music_library.match_progress["running"] = True
         resp = app_client.post("/api/match/start")
         assert resp.status_code == 409
 
@@ -117,10 +117,10 @@ class TestApplyAndUndo:
         self._scanned_and_matched(app_client, music_dir, mock_music_match, wait_for_progress)
 
         below = app_client.post("/api/apply_all", json={"tag": True, "rename": False, "min_confidence": 99}).get_json()
-        assert below["applied"] == 0
+        assert below["attempted"] == 0
 
         above = app_client.post("/api/apply_all", json={"tag": True, "rename": False, "min_confidence": 50}).get_json()
-        assert above["applied"] == 2
+        assert above["succeeded"] == 2
 
     def test_undo_all_reverts_everything(self, app_client, music_dir, mock_music_match, wait_for_progress):
         self._scanned_and_matched(app_client, music_dir, mock_music_match, wait_for_progress)

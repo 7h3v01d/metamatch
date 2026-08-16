@@ -3,11 +3,21 @@
 A local tool that scans your music folder, reads whatever tags/filenames it
 has, looks each track up on MusicBrainz, and shows you a confidence-scored
 match — then lets you write corrected tags and/or rename files, one at a
-time or in bulk.
+time or in bulk. Movies work the same way against TMDB.
 
-Runs entirely on your machine as a small local web app (Flask backend,
-plain HTML/JS frontend — no build step, no external services other than
-the MusicBrainz API for lookups).
+It's built in two layers:
+
+- **`metamatch/`** — a plain Python library with no web dependency. All the
+  actual scan/match/apply/undo/duplicate logic lives here as `MusicLibrary`
+  and `MovieLibrary`. Import and use it directly in a script, notebook, or
+  another application — see "Using it as a library" below.
+- **`app.py`** — a small local web app (Flask backend, plain HTML/JS
+  frontend, no build step) that's just a thin adapter translating HTTP
+  requests into calls against one `MusicLibrary`/`MovieLibrary` instance.
+
+If you only want the app, none of that matters — `python app.py` and go.
+If you want to embed the matching/tagging logic into something bigger,
+the library layer is the point: see "Using it as a library".
 
 ## What it does
 
@@ -41,7 +51,7 @@ the MusicBrainz API for lookups).
   into a `_metamatch_duplicates` folder, never deleted, so it's easy to
   double-check or reverse.
 
-## Setup
+## Setup (running the web app)
 
 ```bash
 cd metamatch
@@ -50,6 +60,66 @@ python app.py
 ```
 
 Then open **http://127.0.0.1:5050** in your browser.
+
+## Using it as a library
+
+Everything the web app does is really just `MusicLibrary`/`MovieLibrary`
+method calls underneath. Install the package and use it directly:
+
+```bash
+pip install -e .          # editable install from this folder, or
+pip install .             # regular install
+# add [webapp] if you also want Flask: pip install ".[webapp]"
+```
+
+```python
+from metamatch import MusicLibrary
+
+lib = MusicLibrary()
+lib.scan("/path/to/music")          # or recursive=False
+lib.match()                         # synchronous; blocks until MusicBrainz lookups finish
+                                     # (pass progress_callback=... or use match_async() for background use)
+
+for track in lib.tracks_payload():
+    match = track.get("match")
+    if match and match["confidence"] >= 85:
+        lib.apply(track["id"], do_tag=True, do_rename=True)
+    elif match:
+        print(f"Low confidence ({match['confidence']}%) for {track['filename']}, skipping")
+
+lib.apply_all(min_confidence=90)    # or apply everything above a bar in one call
+dupes = lib.find_duplicates()       # {"exact": [...], "probable": [...]}
+csv_text = lib.export_csv()
+```
+
+`MovieLibrary` is the same shape, with `do_nfo`/`do_poster` instead of
+`do_art`, and it needs a TMDB key first (`metamatch.config.set_tmdb_api_key(...)`
+or the `TMDB_API_KEY` env var):
+
+```python
+from metamatch import MovieLibrary
+from metamatch import config
+
+config.set_tmdb_api_key("your-tmdb-key")
+
+lib = MovieLibrary()
+lib.scan("/path/to/movies")
+lib.match()
+lib.apply_all(do_rename=True, do_nfo=True, do_poster=True, min_confidence=85)
+```
+
+**Why this shape:** each `MusicLibrary()`/`MovieLibrary()` instance owns its
+own scanned files, matches, and undo history — no module-level globals, no
+singleton state. Create as many as you need (one per user session, one per
+background job, one per test). The package is named `metamatch`, not
+`core` or something equally likely to collide with a host project's own
+module names, specifically so it's safe to add as a dependency elsewhere.
+The individual modules (`metamatch.scanner`, `metamatch.matcher`,
+`metamatch.tagger`, etc.) are also importable on their own if you only need
+one piece, without pulling in the stateful library classes at all — see
+"Project layout" below for what each one does.
+
+
 
 ## Using it
 
@@ -85,52 +155,84 @@ Then open **http://127.0.0.1:5050** in your browser.
 
 ## Notes & limitations
 
-- This release matches **music only** (mp3/wma/etc. via MusicBrainz), per
-  your setup choice — movie matching (mp4/mkv against a database like TMDB)
-  isn't wired up yet. The codebase is structured so a `movie_matcher.py`
-  alongside `matcher.py` plus a similar scan/apply flow could be added
-  later without touching the music path.
 - MusicBrainz lookups need outbound internet access to
   `musicbrainz.org`, and cover art needs access to
   `coverartarchive.org`. If your machine restricts outbound network
   access, matching/art will silently return no results — scanning and
   manual tag entry still work offline.
-- Undo restores tags and the filename, but not embedded art (there's no
-  reliable "no art was here" marker to restore to) — keep the art
-  checkbox off for a file until you're confident in the match if that
-  matters to you.
-- "Probable" duplicates are a heuristic (same MusicBrainz recording, or
-  matching artist+title text) — always check the file list in a group
-  before quarantining; live/remix/cover versions can share a title.
+- Undo restores tags, the filename, and (for movies) a pre-existing
+  `.nfo`/poster's exact original content, but not embedded cover art on
+  music files (there's no reliable "no art was here" marker to restore
+  to) — keep the art checkbox off for a file until you're confident in
+  the match if that matters to you. Embedded movie metadata is only
+  reversible for `.mp4`/`.m4v`; the `.mkv`/`.avi`/`.mov`/`.wmv` path goes
+  through an `ffmpeg` remux that isn't cheaply undoable.
+- "Probable" duplicates are a heuristic (same MusicBrainz recording/TMDB
+  movie, or matching title text) — nothing is preselected for
+  quarantine in that case, unlike byte-identical "exact" duplicates.
+  Always check the file list in a group before quarantining;
+  live/remix/cover versions can share a title.
 - Matching is best-effort: always sanity-check low-confidence matches
   (anything under ~70%) before bulk-applying. The confidence score is a
-  blend of fuzzy text and duration matching, not a guarantee.
-- This is a single-user local tool — state (scanned folder, match results)
-  lives in memory while `app.py` is running and resets when you restart it.
+  blend of fuzzy text, duration/year, and (for movies) TMDB search
+  relevance ordering — it does not factor in a movie's popularity/rating,
+  since that's evidence of nothing about *which* movie a file actually is.
+- `apply()` re-checks a file's size and modification time against what
+  was recorded at scan time before touching it, and refuses (with a
+  clear error) if something replaced or modified the file at that path
+  in the meantime — e.g. another program writing to it, or a very stale
+  scan. Rescan to clear the error.
+- Quarantine only ever accepts files that the current scan itself
+  discovered — not arbitrary paths — and the `_metamatch_duplicates`
+  folder it creates is excluded from future scans of the same directory.
+- This is a single-user local tool bound to `127.0.0.1` with no auth
+  token; the local API rejects state-changing requests whose `Origin`
+  header doesn't match its own host (closing off drive-by browser CSRF),
+  but it isn't hardened against other processes already running on the
+  same machine.
+- CSV exports neutralize values that would be interpreted as spreadsheet
+  formulas (`=`, `+`, `-`, `@` prefixes) since matched metadata and
+  filenames are untrusted external text by the time they reach a CSV cell.
+- State (scanned folder, match results, undo history) lives in memory
+  while `app.py`/a `MusicLibrary`/`MovieLibrary` instance is running and
+  is lost on restart — there's no persistent transaction log, so a crash
+  mid-operation can't be recovered from automatically (the underlying
+  file operations are individually safe - fail-closed remux, fingerprint
+  checks, collision-safe renames - but there's no cross-operation undo
+  journal spanning a restart).
 
 ## Project layout
 
 ```
-metamatch/
-  app.py                 Flask routes + in-memory session state
-  core/
-    scanner.py             Music: folder walking, tag reading, filename parsing
-    matcher.py               Music: MusicBrainz search + confidence scoring
-    tagger.py                   Music: tag writing, cover art embedding, renaming
-    art.py                        Music: Cover Art Archive lookups (cached)
-    dedup.py                        Music: duplicate detection, quarantine
-    video_scanner.py       Movies: folder walking, ffprobe reads, filename parsing
-    movie_matcher.py         Movies: TMDB search + confidence scoring
-    movie_tagger.py             Movies: rename, .nfo write, poster download, embed
-    config.py                     Movies: TMDB API key storage
-  templates/index.html   Page shell (Music/Movies tabs)
-  static/style.css         UI styling
-  static/app.js               Frontend logic (fetch calls, rendering)
-  requirements.txt
-  requirements-dev.txt   Adds pytest for running the test suite
+metamatch/                (repo root)
+  metamatch/                 The library - importable on its own, no Flask dependency
+    __init__.py                 Public API: MusicLibrary, MovieLibrary
+    library.py                    MusicLibrary/MovieLibrary - the stateful orchestration layer
+    scanner.py                      Music: folder walking, tag reading, filename parsing
+    matcher.py                        Music: MusicBrainz search + confidence scoring
+    tagger.py                           Music: tag writing, cover art embedding, renaming
+    art.py                                Music: Cover Art Archive lookups (cached)
+    dedup.py                                Shared: duplicate detection, quarantine (music + movies)
+    video_scanner.py                  Movies: folder walking, ffprobe reads, filename parsing
+    movie_matcher.py                    Movies: TMDB search + confidence scoring
+    movie_tagger.py                       Movies: rename, .nfo write, poster download, embed
+    config.py                               TMDB API key storage
+  app.py                    Thin Flask adapter over one MusicLibrary + one MovieLibrary
+  templates/index.html      Page shell (Music/Movies tabs)
+  static/style.css            UI styling
+  static/app.js                  Frontend logic (fetch calls, rendering)
+  pyproject.toml            Packaging metadata (pip install -e . to use as a library)
+  requirements.txt          Deps for running the web app (includes Flask)
+  requirements-dev.txt      Adds pytest for running the test suite
   pytest.ini
-  tests/                  See "Running the tests" below
+  tests/                     See "Running the tests" below
 ```
+
+`app.py` only calls methods on `music_library`/`movie_library` (one
+`MusicLibrary`/`MovieLibrary` instance each) and translates the result to
+JSON — it holds no scan/match/apply/undo logic itself. Anything in
+`metamatch/` can be imported and used without app.py or Flask ever being
+involved; see "Using it as a library" above.
 
 ## Movie matching (TMDB)
 
@@ -192,11 +294,12 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-157 tests covering both the music and movie sides: filename/tag parsing,
+224 tests covering both the music and movie sides: filename/tag parsing,
 match-scoring math, tag writing and cover-art/poster embedding, renaming,
 undo (including the "don't delete a sidecar that already existed"
-edge case), duplicate detection and quarantine, TMDB key storage, and
-the full Flask route layer for both `/api/*` and `/api/movies/*`.
+edge case), duplicate detection and quarantine, TMDB key storage, the
+`MusicLibrary`/`MovieLibrary` classes used directly (no Flask involved),
+and the full Flask route layer for both `/api/*` and `/api/movies/*`.
 
 None of it touches the network — MusicBrainz, TMDB, and Cover Art
 Archive/poster lookups are all monkeypatched with fixtures in
@@ -212,12 +315,12 @@ marked `@requires_ffmpeg` and skip cleanly (rather than fail) if it isn't
 installed — run `pytest -v` to see which ones were skipped and why.
 
 Config-touching tests use the `isolated_config` fixture, which redirects
-`core/config.py` to a temp directory for the duration of the test, so
+`metamatch/config.py` to a temp directory for the duration of the test, so
 the suite never reads or writes your real `~/.metamatch/config.json`.
 
 ```
 tests/
-  conftest.py           Fixtures: media generation, mocks, app state reset
+  conftest.py           Fixtures: media generation, mocks, fresh library instances
   test_scanner.py         Music filename parsing + tag reading
   test_matcher.py           MusicBrainz scoring math
   test_tagger.py               Tag writing, cover art, rename, undo helpers
@@ -227,6 +330,8 @@ tests/
   test_movie_matcher.py      TMDB scoring math
   test_movie_tagger.py         Rename, .nfo, poster, embedded metadata
   test_config.py                 TMDB key storage
-  test_app_music.py              Music Flask routes, end to end
-  test_app_movies.py               Movie Flask routes, end to end
+  test_library.py                  MusicLibrary/MovieLibrary used directly, no Flask
+  test_app_music.py                  Music Flask routes, end to end
+  test_app_movies.py                   Movie Flask routes, end to end
+  test_hardening.py                      Regressions for an adversarial security/robustness review
 ```

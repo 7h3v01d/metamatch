@@ -121,7 +121,7 @@ def movie_dir(tmp_path, media_fixtures_dir):
 
 @pytest.fixture
 def isolated_config(tmp_path, monkeypatch):
-    from core import config as app_config
+    from metamatch import config as app_config
 
     fake_dir = tmp_path / "config_home"
     fake_path = fake_dir / "config.json"
@@ -163,25 +163,26 @@ def make_fake_movie_match(**overrides) -> dict:
 
 @pytest.fixture
 def mock_music_match(monkeypatch):
-    """Patches MusicBrainz lookups everywhere they're called from (core.matcher and app)."""
-    import core.matcher as matcher_module
+    """Patches MusicBrainz lookups at the source (metamatch.matcher.find_best_match).
+
+    match_tracks() looks this name up from its own module globals at call
+    time, so patching it here covers callers through MusicLibrary, the
+    Flask app, or any other code path - without needing to know who's
+    calling.
+    """
+    import metamatch.matcher as matcher_module
 
     def fake_find_best_match(track):
         return make_fake_music_match()
 
     monkeypatch.setattr(matcher_module, "find_best_match", fake_find_best_match)
-    try:
-        import app as app_module
-        monkeypatch.setattr(app_module, "match_tracks", matcher_module.match_tracks)
-    except ImportError:
-        pass
     return fake_find_best_match
 
 
 @pytest.fixture
 def mock_movie_match(monkeypatch):
-    """Patches TMDB lookups everywhere they're called from (core.movie_matcher)."""
-    import core.movie_matcher as movie_matcher_module
+    """Patches TMDB lookups at the source (metamatch.movie_matcher.find_best_match)."""
+    import metamatch.movie_matcher as movie_matcher_module
 
     def fake_find_best_match(video):
         return make_fake_movie_match()
@@ -192,7 +193,7 @@ def mock_movie_match(monkeypatch):
 
 @pytest.fixture
 def mock_cover_art(monkeypatch):
-    """Patches Cover Art Archive fetches, including the copy already bound into app.py."""
+    """Patches Cover Art Archive fetches, including app.py's directly-imported copy."""
     fake_bytes = b"\xff\xd8\xff\xe0FAKEJPEGDATA" * 5
 
     def fake_fetch(release_id, size="250"):
@@ -200,10 +201,12 @@ def mock_cover_art(monkeypatch):
             return None
         return (fake_bytes, "image/jpeg")
 
-    import core.art as art_module
+    import metamatch.art as art_module
     monkeypatch.setattr(art_module, "fetch_cover_art", fake_fetch)
     try:
         import app as app_module
+        # app.py's /api/art route imported fetch_cover_art by name, so that
+        # binding needs patching separately from the module attribute above.
         monkeypatch.setattr(app_module, "fetch_cover_art", fake_fetch)
     except ImportError:
         pass
@@ -213,7 +216,7 @@ def mock_cover_art(monkeypatch):
 @pytest.fixture
 def mock_poster_download(monkeypatch):
     """Patches poster downloads (movie_tagger writes a fake poster file instead of hitting TMDB's CDN)."""
-    import core.movie_tagger as movie_tagger_module
+    import metamatch.movie_tagger as movie_tagger_module
     fake_bytes = b"FAKEPOSTERBYTES"
 
     def fake_download(path, match):
@@ -228,24 +231,19 @@ def mock_poster_download(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Flask app client with isolated, reset in-memory state per test
+# Flask app client with a fresh MusicLibrary/MovieLibrary per test
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def app_client(isolated_config, monkeypatch):
     import app as app_module
+    from metamatch import MusicLibrary, MovieLibrary
 
-    app_module.STATE["folder"] = None
-    app_module.STATE["tracks"] = {}
-    app_module.STATE["order"] = []
-    app_module.STATE["match_progress"] = {"running": False, "done": 0, "total": 0}
-    app_module.STATE["undo_by_path"] = {}
-
-    app_module.MOVIE_STATE["folder"] = None
-    app_module.MOVIE_STATE["videos"] = {}
-    app_module.MOVIE_STATE["order"] = []
-    app_module.MOVIE_STATE["match_progress"] = {"running": False, "done": 0, "total": 0, "error": None}
-    app_module.MOVIE_STATE["undo_by_path"] = {}
+    # Swap in fresh library instances so tests never see state left over
+    # from a previous test (mirrors what a host app gets by simply
+    # instantiating its own MusicLibrary()/MovieLibrary() per session).
+    monkeypatch.setattr(app_module, "music_library", MusicLibrary())
+    monkeypatch.setattr(app_module, "movie_library", MovieLibrary())
 
     app_module.app.config.update(TESTING=True)
     return app_module.app.test_client()

@@ -1,7 +1,7 @@
 import pytest
 
-from core.matcher import score_candidate, find_best_match, _duration_score
-from core.scanner import TrackFile
+from metamatch.matcher import score_candidate, find_best_match, _duration_score
+from metamatch.scanner import TrackFile
 
 
 def make_track(**overrides) -> TrackFile:
@@ -93,7 +93,7 @@ class TestFindBestMatch:
         assert find_best_match(track) is None
 
     def test_picks_highest_scoring_candidate(self, monkeypatch):
-        import core.matcher as matcher_module
+        import metamatch.matcher as matcher_module
 
         def fake_search(artist, title, limit=5):
             return [
@@ -109,7 +109,7 @@ class TestFindBestMatch:
         assert best["recording_id"] == "good"
 
     def test_retries_without_artist_when_no_results(self, monkeypatch):
-        import core.matcher as matcher_module
+        import metamatch.matcher as matcher_module
         calls = []
 
         def fake_search(artist, title, limit=5):

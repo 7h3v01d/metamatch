@@ -12,12 +12,13 @@ import os
 import re
 import struct
 
-from mutagen.id3 import ID3, ID3NoHeaderError, APIC
+from mutagen.id3 import ID3, ID3NoHeaderError, APIC, TIT2, TPE1, TALB, TDRC
 from mutagen.easyid3 import EasyID3
 from mutagen.asf import ASF, ASFByteArrayAttribute
 from mutagen.flac import FLAC, Picture
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggvorbis import OggVorbis
+from mutagen.wave import WAVE
 
 _INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -28,10 +29,29 @@ _MIME_TO_MP4_FORMAT = {
 }
 
 
+_RESERVED_WINDOWS_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+_MAX_FILENAME_LENGTH = 200  # conservative; leaves headroom for the extension + "(2)" collision suffixes
+
+
 def sanitize_filename(name: str) -> str:
     cleaned = _INVALID_CHARS.sub("", name)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
-    return cleaned or "untitled"
+    cleaned = cleaned or "untitled"
+
+    if len(cleaned) > _MAX_FILENAME_LENGTH:
+        cleaned = cleaned[:_MAX_FILENAME_LENGTH].rstrip(" .") or "untitled"
+
+    # Windows reserves these names outright, with or without an extension
+    # ("CON.mp3" is just as unusable as "CON") - renaming to one of these
+    # would otherwise fail, or behave strangely, on that platform.
+    if cleaned.upper() in _RESERVED_WINDOWS_NAMES:
+        cleaned = f"_{cleaned}"
+
+    return cleaned
 
 
 def apply_tags(path: str, match: dict) -> None:
@@ -68,6 +88,24 @@ def apply_tags(path: str, match: dict) -> None:
             audio["WM/AlbumTitle"] = album
         if date:
             audio["WM/Year"] = date
+        audio.save()
+
+    elif ext == ".wav":
+        # WAVE embeds real ID3v2 frames in a RIFF chunk - mutagen's generic
+        # easy=True interface doesn't understand that container, so this
+        # writes raw ID3 Frame objects directly (same underlying tag format
+        # mp3 uses, just accessed through mutagen.wave.WAVE instead).
+        audio = WAVE(path)
+        if audio.tags is None:
+            audio.add_tags()
+        if artist:
+            audio.tags.setall("TPE1", [TPE1(encoding=3, text=[artist])])
+        if title:
+            audio.tags.setall("TIT2", [TIT2(encoding=3, text=[title])])
+        if album:
+            audio.tags.setall("TALB", [TALB(encoding=3, text=[album])])
+        if date:
+            audio.tags.setall("TDRC", [TDRC(encoding=3, text=[date])])
         audio.save()
 
     else:
@@ -120,6 +158,14 @@ def embed_cover_art(path: str, image_bytes: bytes, mime: str) -> None:
         audio = ASF(path)
         payload = _build_wma_picture_bytes(image_bytes, mime, "Cover")
         audio["WM/Picture"] = [ASFByteArrayAttribute(payload)]
+        audio.save()
+
+    elif ext == ".wav":
+        audio = WAVE(path)
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags.delall("APIC")
+        audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=image_bytes))
         audio.save()
 
     elif ext == ".flac":
@@ -235,6 +281,19 @@ def set_or_clear_tags(path: str, artist=None, title=None, album=None, date=None)
                 audio[asf_key] = value
             elif asf_key in audio:
                 del audio[asf_key]
+        audio.save()
+
+    elif ext == ".wav":
+        audio = WAVE(path)
+        if audio.tags is None:
+            audio.add_tags()
+        frame_map = {"artist": ("TPE1", TPE1), "title": ("TIT2", TIT2), "album": ("TALB", TALB), "date": ("TDRC", TDRC)}
+        for key, value in fields.items():
+            frame_id, frame_cls = frame_map[key]
+            if value:
+                audio.tags.setall(frame_id, [frame_cls(encoding=3, text=[value])])
+            elif frame_id in audio.tags:
+                audio.tags.delall(frame_id)
         audio.save()
 
     else:

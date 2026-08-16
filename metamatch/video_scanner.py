@@ -50,6 +50,7 @@ class VideoFile:
     ext: str
     size_bytes: int
     duration_seconds: Optional[float] = None
+    mtime_ns: Optional[int] = None
 
     tag_title: Optional[str] = None
     tag_year: Optional[str] = None
@@ -126,7 +127,9 @@ def _ffprobe(path: str) -> dict:
 def read_video(path: str) -> VideoFile:
     filename = os.path.basename(path)
     ext = os.path.splitext(filename)[1].lower()
-    size_bytes = os.path.getsize(path)
+    stat_result = os.stat(path)
+    size_bytes = stat_result.st_size
+    mtime_ns = stat_result.st_mtime_ns
 
     fmt = _ffprobe(path)
     duration = None
@@ -148,7 +151,7 @@ def read_video(path: str) -> VideoFile:
 
     return VideoFile(
         path=path, filename=filename, ext=ext, size_bytes=size_bytes,
-        duration_seconds=duration,
+        duration_seconds=duration, mtime_ns=mtime_ns,
         tag_title=tag_title, tag_year=tag_year,
         guess_title=guess_title, guess_year=guess_year,
     )
@@ -158,10 +161,15 @@ def scan_folder(folder: str, recursive: bool = True) -> list[VideoFile]:
     if not os.path.isdir(folder):
         raise NotADirectoryError(f"Not a folder: {folder}")
 
+    from .dedup import QUARANTINE_DIRNAME
+
     results: list[VideoFile] = []
     walker = os.walk(folder) if recursive else [(folder, [], os.listdir(folder))]
 
-    for root, _dirs, files in walker:
+    for root, dirs, files in walker:
+        # Don't walk into our own quarantine folder - see the matching
+        # comment in scanner.py for why.
+        dirs[:] = [d for d in dirs if d != QUARANTINE_DIRNAME]
         for name in files:
             ext = os.path.splitext(name)[1].lower()
             if ext in SUPPORTED_EXTENSIONS:

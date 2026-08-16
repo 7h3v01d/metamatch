@@ -85,6 +85,17 @@ def find_exact_duplicates(tracks: list) -> list[dict]:
     return groups
 
 
+def _all_byte_identical(tracks: list) -> bool:
+    """True if every file in the group is byte-for-byte identical to the first."""
+    if len(tracks) < 2:
+        return False
+    try:
+        first_hash = file_hash(tracks[0].path)
+        return all(file_hash(t.path) == first_hash for t in tracks[1:])
+    except OSError:
+        return False
+
+
 def find_probable_duplicates(tracks: list) -> list[dict]:
     by_key: dict[str, list] = defaultdict(list)
     for t in tracks:
@@ -94,17 +105,19 @@ def find_probable_duplicates(tracks: list) -> list[dict]:
 
     groups = []
     for key, group_tracks in by_key.items():
+        if len(group_tracks) <= 1:
+            continue
         # Skip groups where every file in it is also byte-identical - not
         # worth a second listing; exact-duplicate detection already covers it.
-        distinct_sizes = {t.size_bytes for t in group_tracks}
-        if len(group_tracks) > 1:
-            label = "Same MusicBrainz recording" if key.startswith("mb:") else "Same artist + title"
-            groups.append({
-                "type": "probable",
-                "key": key,
-                "label": label,
-                "files": [_file_summary(t) for t in group_tracks],
-            })
+        if _all_byte_identical(group_tracks):
+            continue
+        label = "Same MusicBrainz recording" if key.startswith("mb:") else "Same artist + title"
+        groups.append({
+            "type": "probable",
+            "key": key,
+            "label": label,
+            "files": [_file_summary(t) for t in group_tracks],
+        })
     return groups
 
 
@@ -117,14 +130,17 @@ def find_probable_duplicates_movies(videos: list) -> list[dict]:
 
     groups = []
     for key, group_videos in by_key.items():
-        if len(group_videos) > 1:
-            label = "Same TMDB movie" if key.startswith("tmdb:") else "Same title + year"
-            groups.append({
-                "type": "probable",
-                "key": key,
-                "label": label,
-                "files": [_file_summary(v) for v in group_videos],
-            })
+        if len(group_videos) <= 1:
+            continue
+        if _all_byte_identical(group_videos):
+            continue
+        label = "Same TMDB movie" if key.startswith("tmdb:") else "Same title + year"
+        groups.append({
+            "type": "probable",
+            "key": key,
+            "label": label,
+            "files": [_file_summary(v) for v in group_videos],
+        })
     return groups
 
 

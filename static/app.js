@@ -219,12 +219,16 @@ function pollProgress() {
     progressFill.style.width = pct + "%";
     progressLabel.textContent = `${p.done} / ${p.total}`;
 
-    if (!p.running && p.total > 0 && p.done >= p.total) {
+    // "running" going false is the authoritative completion signal - relying
+    // on done >= total as well meant a run that stopped early (an error
+    // partway through) would poll forever, since done would never catch up
+    // to total.
+    if (!p.running) {
       clearInterval(progressTimer);
       matchBtn.disabled = false;
       applyRow.hidden = false;
       await refreshTracks();
-      showToast("Matching complete.");
+      showToast(p.error ? p.error : "Matching complete.", !!p.error);
     }
   }, 600);
 }
@@ -255,7 +259,11 @@ applyAllBtn.addEventListener("click", async () => {
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "Bulk apply failed.");
-    showToast(`Applied to ${data.applied} file(s) at or above ${thresholdInput.value}% confidence.`);
+    if (data.failed > 0) {
+      showToast(`${data.succeeded} succeeded, ${data.failed} failed (of ${data.attempted} at or above ${thresholdInput.value}%). Check rows for errors.`, true);
+    } else {
+      showToast(`Applied to ${data.succeeded} file(s) at or above ${thresholdInput.value}% confidence.`);
+    }
     await refreshTracks();
   } catch (e) {
     showToast(e.message, true);
@@ -519,7 +527,7 @@ function pollMovieProgress() {
     movieProgressFill.style.width = pct + "%";
     movieProgressLabel.textContent = `${p.done} / ${p.total}`;
 
-    if (!p.running && p.total > 0 && p.done >= p.total) {
+    if (!p.running) {
       clearInterval(movieProgressTimer);
       movieMatchBtn.disabled = false;
       movieApplyRow.hidden = false;
@@ -600,7 +608,11 @@ movieApplyAllBtn.addEventListener("click", async () => {
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "Bulk apply failed.");
-    showToast(`Applied to ${data.applied} file(s) at or above ${movieThresholdInput.value}% confidence.`);
+    if (data.failed > 0) {
+      showToast(`${data.succeeded} succeeded, ${data.failed} failed (of ${data.attempted} at or above ${movieThresholdInput.value}%). Check rows for errors.`, true);
+    } else {
+      showToast(`Applied to ${data.succeeded} file(s) at or above ${movieThresholdInput.value}% confidence.`);
+    }
     await refreshMovies();
   } catch (e) {
     showToast(e.message, true);
@@ -631,9 +643,10 @@ movieUndoAllBtn.addEventListener("click", async () => {
 /* ------------------------- Movie duplicates --------------------------- */
 
 function movieDedupGroupHtml(group, groupIdx) {
+  const isExact = group.type === "exact";
   const rows = group.files.map((f, i) => `
     <label class="dupe-row">
-      <input type="checkbox" class="movie-dupe-check" data-group="${groupIdx}" data-path="${escapeHtml(f.path)}" ${i === 0 ? "" : "checked"}>
+      <input type="checkbox" class="movie-dupe-check" data-group="${groupIdx}" data-path="${escapeHtml(f.path)}" ${isExact && i !== 0 ? "checked" : ""}>
       <span class="dupe-name">${escapeHtml(f.filename)}</span>
       <span class="dupe-meta">${(f.size_bytes / 1024 / 1024).toFixed(0)} MB${f.duration_seconds ? " · " + Math.round(f.duration_seconds / 60) + " min" : ""}${f.confidence !== null && f.confidence !== undefined ? " · " + f.confidence.toFixed(0) + "% match" : ""}</span>
     </label>
@@ -704,9 +717,14 @@ movieScanDupesBtn.addEventListener("click", async () => {
 /* ---------------------------- Duplicates ---------------------------- */
 
 function dedupGroupHtml(group, groupIdx) {
+  // Only pre-check "keep the first, flag the rest" for byte-identical
+  // (exact) groups - "probable" is a heuristic match (same MusicBrainz
+  // recording or same artist+title text), not proof of duplication, so
+  // nothing is preselected and the person has to make an active choice.
+  const isExact = group.type === "exact";
   const rows = group.files.map((f, i) => `
     <label class="dupe-row">
-      <input type="checkbox" class="dupe-check" data-group="${groupIdx}" data-path="${escapeHtml(f.path)}" ${i === 0 ? "" : "checked"}>
+      <input type="checkbox" class="dupe-check" data-group="${groupIdx}" data-path="${escapeHtml(f.path)}" ${isExact && i !== 0 ? "checked" : ""}>
       <span class="dupe-name">${escapeHtml(f.filename)}</span>
       <span class="dupe-meta">${(f.size_bytes / 1024 / 1024).toFixed(1)} MB${f.duration_seconds ? " · " + Math.round(f.duration_seconds) + "s" : ""}${f.confidence !== null && f.confidence !== undefined ? " · " + f.confidence.toFixed(0) + "% match" : ""}</span>
     </label>
@@ -740,7 +758,7 @@ scanDupesBtn.addEventListener("click", async () => {
       </div>
       <div class="action-row" style="margin-top:16px;">
         <button id="quarantineBtn" class="btn btn-primary">Move checked files to _metamatch_duplicates</button>
-        <p class="status-line" style="margin:0;">Checked files are moved, never deleted — the first file in each group is unchecked by default.</p>
+        <p class="status-line" style="margin:0;">Checked files are moved, never deleted. Exact (identical) duplicates come pre-checked except the first; probable duplicates are a heuristic, so nothing is pre-checked — review before selecting.</p>
       </div>
     `;
 

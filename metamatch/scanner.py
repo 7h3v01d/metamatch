@@ -40,6 +40,7 @@ class TrackFile:
     ext: str
     size_bytes: int
     duration_seconds: Optional[float] = None
+    mtime_ns: Optional[int] = None
 
     tag_artist: Optional[str] = None
     tag_title: Optional[str] = None
@@ -137,6 +138,31 @@ def _read_wma_tags(path: str) -> dict:
     return tags
 
 
+def _read_wav_tags(path: str) -> dict:
+    """WAVE embeds real ID3v2 frames in a RIFF chunk - mutagen.File(easy=True)
+    doesn't understand that (it returns a WAVE object with no easy-tag
+    interface, tags silently read as empty), so this reads the raw ID3
+    frames directly instead, the same way _read_mp3_tags does under the
+    hood via EasyID3."""
+    tags = {}
+    try:
+        from mutagen.wave import WAVE
+        audio = WAVE(path)
+        if audio.tags:
+            def first(frame_id):
+                frame = audio.tags.get(frame_id)
+                return str(frame.text[0]) if frame and frame.text else None
+
+            tags["artist"] = first("TPE1")
+            tags["title"] = first("TIT2")
+            tags["album"] = first("TALB")
+            tags["tracknumber"] = first("TRCK")
+            tags["date"] = first("TDRC")
+    except Exception:
+        pass
+    return tags
+
+
 def _read_generic_tags(path: str) -> dict:
     """Fallback for flac/m4a/ogg using mutagen's generic File + EasyTags-like access."""
     tags = {}
@@ -156,7 +182,9 @@ def _read_generic_tags(path: str) -> dict:
 def read_track(path: str) -> TrackFile:
     filename = os.path.basename(path)
     ext = os.path.splitext(filename)[1].lower()
-    size_bytes = os.path.getsize(path)
+    stat_result = os.stat(path)
+    size_bytes = stat_result.st_size
+    mtime_ns = stat_result.st_mtime_ns
 
     duration = None
     try:
@@ -170,6 +198,8 @@ def read_track(path: str) -> TrackFile:
         tags = _read_mp3_tags(path)
     elif ext == ".wma":
         tags = _read_wma_tags(path)
+    elif ext == ".wav":
+        tags = _read_wav_tags(path)
     else:
         tags = _read_generic_tags(path)
 
@@ -181,6 +211,7 @@ def read_track(path: str) -> TrackFile:
         ext=ext,
         size_bytes=size_bytes,
         duration_seconds=duration,
+        mtime_ns=mtime_ns,
         tag_artist=tags.get("artist"),
         tag_title=tags.get("title"),
         tag_album=tags.get("album"),
@@ -195,13 +226,19 @@ def scan_folder(folder: str, recursive: bool = True) -> list[TrackFile]:
     if not os.path.isdir(folder):
         raise NotADirectoryError(f"Not a folder: {folder}")
 
+    from .dedup import QUARANTINE_DIRNAME
+
     results: list[TrackFile] = []
     if recursive:
         walker = os.walk(folder)
     else:
         walker = [(folder, [], os.listdir(folder))]
 
-    for root, _dirs, files in walker:
+    for root, dirs, files in walker:
+        # Don't walk into our own quarantine folder - a file moved there
+        # to get it out of the working set shouldn't reappear on the very
+        # next scan of the same folder.
+        dirs[:] = [d for d in dirs if d != QUARANTINE_DIRNAME]
         for name in files:
             ext = os.path.splitext(name)[1].lower()
             if ext in SUPPORTED_EXTENSIONS:

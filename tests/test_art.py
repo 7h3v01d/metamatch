@@ -1,6 +1,6 @@
 import pytest
 
-from core import art
+from metamatch import art
 
 
 class FakeResponse:
@@ -13,6 +13,7 @@ class FakeResponse:
 class TestFetchCoverArt:
     def setup_method(self):
         art._cache.clear()
+        art._negative_cache.clear()
 
     def test_returns_none_for_missing_release_id(self):
         assert art.fetch_cover_art(None) is None

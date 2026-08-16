@@ -3,7 +3,7 @@ import shutil
 
 import pytest
 
-from core.tagger import (
+from metamatch.tagger import (
     sanitize_filename,
     apply_tags,
     rename_to_match,
@@ -11,7 +11,7 @@ from core.tagger import (
     set_or_clear_tags,
     apply_match,
 )
-from core.scanner import read_track
+from metamatch.scanner import read_track
 from conftest import requires_ffmpeg
 
 

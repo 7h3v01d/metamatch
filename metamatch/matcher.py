@@ -29,10 +29,10 @@ _MIN_INTERVAL = 1.05  # seconds, stay comfortably under MB's rate limit
 def _throttle():
     global _last_request_time
     with _last_request_lock:
-        elapsed = time.time() - _last_request_time
+        elapsed = time.monotonic() - _last_request_time
         if elapsed < _MIN_INTERVAL:
             time.sleep(_MIN_INTERVAL - elapsed)
-        _last_request_time = time.time()
+        _last_request_time = time.monotonic()
 
 
 def _mb_search(artist: Optional[str], title: Optional[str], limit: int = 5) -> list[dict]:
@@ -169,8 +169,17 @@ def find_best_match(track) -> Optional[dict]:
 
 
 def match_tracks(tracks: list, progress_callback=None) -> None:
-    """Mutates each track in-place, setting track.match to the best candidate dict."""
+    """Mutates each track in-place, setting track.match to the best candidate dict.
+
+    A failure on one track (an unexpected exception from a future search
+    provider, a malformed tag, etc.) is isolated to that track rather than
+    aborting the whole batch - the rest of a large library shouldn't go
+    unmatched because of one bad file.
+    """
     for i, track in enumerate(tracks):
-        track.match = find_best_match(track)
+        try:
+            track.match = find_best_match(track)
+        except Exception:
+            track.match = None
         if progress_callback:
             progress_callback(i + 1, len(tracks))

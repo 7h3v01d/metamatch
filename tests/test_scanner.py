@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from core.scanner import (
+from metamatch.scanner import (
     _clean_filename_stem,
     _guess_artist_title_from_filename,
     read_track,

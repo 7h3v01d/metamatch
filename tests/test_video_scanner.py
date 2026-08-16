@@ -1,6 +1,6 @@
 import pytest
 
-from core.video_scanner import _guess_title_year_from_filename, read_video, scan_folder
+from metamatch.video_scanner import _guess_title_year_from_filename, read_video, scan_folder
 from conftest import requires_ffmpeg
 
 

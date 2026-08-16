@@ -160,7 +160,13 @@ class TestMovieApplyAndUndo:
         })
         app_client.post("/api/movies/undo", json={"id": target["id"]})
 
-        assert os.path.exists(nfo_path)  # not deleted, even though content was overwritten
+        assert os.path.exists(nfo_path)
+        # Undo restores the pre-existing sidecar's actual original content,
+        # not just its presence - see tests/test_hardening.py for more on
+        # the fix that made this possible (byte-snapshotting sidecars
+        # before overwriting them).
+        with open(nfo_path) as f:
+            assert f.read() == "<movie><title>Pre-existing</title></movie>"
 
     def test_apply_all_respects_threshold(self, app_client, movie_dir, mock_movie_match, wait_for_progress):
         self._scanned_and_matched(app_client, movie_dir, mock_movie_match, wait_for_progress)
@@ -168,12 +174,12 @@ class TestMovieApplyAndUndo:
         below = app_client.post("/api/movies/apply_all", json={
             "rename": False, "nfo": False, "poster": False, "min_confidence": 99,
         }).get_json()
-        assert below["applied"] == 0
+        assert below["attempted"] == 0
 
         above = app_client.post("/api/movies/apply_all", json={
             "rename": False, "nfo": False, "poster": False, "min_confidence": 50,
         }).get_json()
-        assert above["applied"] == 2
+        assert above["succeeded"] == 2
 
     def test_undo_all(self, app_client, movie_dir, mock_movie_match, mock_poster_download, wait_for_progress):
         self._scanned_and_matched(app_client, movie_dir, mock_movie_match, wait_for_progress)

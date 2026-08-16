@@ -15,7 +15,7 @@ from typing import Optional
 import requests
 from rapidfuzz import fuzz
 
-from core.config import get_tmdb_api_key
+from .config import get_tmdb_api_key
 
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -28,10 +28,10 @@ _MIN_INTERVAL = 0.05  # TMDB's limits are generous; a light throttle is plenty
 def _throttle():
     global _last_request_time
     with _last_request_lock:
-        elapsed = time.time() - _last_request_time
+        elapsed = time.monotonic() - _last_request_time
         if elapsed < _MIN_INTERVAL:
             time.sleep(_MIN_INTERVAL - elapsed)
-        _last_request_time = time.time()
+        _last_request_time = time.monotonic()
 
 
 class TmdbNotConfigured(Exception):
@@ -78,7 +78,17 @@ def _year_score(local_year: Optional[str], candidate_date: Optional[str]) -> Opt
     return 0.0
 
 
-def score_candidate(video, candidate: dict) -> dict:
+def _rank_score(rank: Optional[int]) -> Optional[float]:
+    """TMDB returns search results in relevance order - being result #1 for
+    a title+year query is real evidence of identity, unlike a movie's
+    rating (popularity says nothing about whether *this* is the right
+    movie). Rank 0 scores 100, falling off quickly after that."""
+    if rank is None:
+        return None
+    return max(0.0, 100.0 - rank * 25.0)
+
+
+def score_candidate(video, candidate: dict, rank: Optional[int] = None) -> dict:
     query_title = video.tag_title or video.guess_title or video.filename
     query_year = video.tag_year or video.guess_year
 
@@ -92,8 +102,13 @@ def score_candidate(video, candidate: dict) -> dict:
         fuzz.token_sort_ratio(query_title, cand_original_title) if cand_original_title else 0,
     )
     year_sim = _year_score(query_year, cand_date)
-    vote_score = min(100.0, float(candidate.get("vote_average") or 0) * 10)
+    rank_sim = _rank_score(rank)
 
+    # vote_average (the movie's TMDB rating) is intentionally NOT part of
+    # this blend - a popular movie sharing a title with the correct-but-
+    # obscure one would otherwise win on rating alone even with an
+    # identical title match and no other supporting evidence. It's still
+    # returned below for display, just not used to judge identity.
     weighted_sum = title_sim * 0.55
     total_weight = 0.55
 
@@ -101,8 +116,9 @@ def score_candidate(video, candidate: dict) -> dict:
         weighted_sum += year_sim * 0.30
         total_weight += 0.30
 
-    weighted_sum += vote_score * 0.15
-    total_weight += 0.15
+    if rank_sim is not None:
+        weighted_sum += rank_sim * 0.15
+        total_weight += 0.15
 
     confidence = round(weighted_sum / total_weight, 1) if total_weight else 0.0
 
@@ -120,6 +136,7 @@ def score_candidate(video, candidate: dict) -> dict:
         "poster_url_full": f"{TMDB_IMAGE_BASE}/original{poster_path}" if poster_path else None,
         "title_similarity": round(title_sim, 1),
         "year_similarity": round(year_sim, 1) if year_sim is not None else None,
+        "search_rank": rank,
         "confidence": confidence,
         "tmdb_url": f"https://www.themoviedb.org/movie/{candidate.get('id')}" if candidate.get("id") else None,
     }
@@ -138,7 +155,7 @@ def find_best_match(video) -> Optional[dict]:
     if not candidates:
         return None
 
-    scored = [score_candidate(video, c) for c in candidates]
+    scored = [score_candidate(video, c, rank=i) for i, c in enumerate(candidates)]
     scored.sort(key=lambda s: s["confidence"], reverse=True)
     return scored[0]
 

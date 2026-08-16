@@ -1,7 +1,7 @@
 import pytest
 
-from core.movie_matcher import score_candidate, find_best_match, _year_score, TmdbNotConfigured
-from core.video_scanner import VideoFile
+from metamatch.movie_matcher import score_candidate, find_best_match, _year_score, TmdbNotConfigured
+from metamatch.video_scanner import VideoFile
 
 
 def make_video(**overrides) -> VideoFile:
@@ -81,7 +81,7 @@ class TestFindBestMatch:
         assert find_best_match(video) is None
 
     def test_raises_when_not_configured(self, monkeypatch):
-        import core.movie_matcher as movie_matcher_module
+        import metamatch.movie_matcher as movie_matcher_module
 
         def fake_search(title, year, limit=5):
             raise TmdbNotConfigured("no key")
@@ -92,7 +92,7 @@ class TestFindBestMatch:
             find_best_match(video)
 
     def test_picks_best_scoring_candidate(self, monkeypatch):
-        import core.movie_matcher as movie_matcher_module
+        import metamatch.movie_matcher as movie_matcher_module
 
         def fake_search(title, year, limit=5):
             return [
@@ -106,7 +106,7 @@ class TestFindBestMatch:
         assert best["tmdb_id"] == 2
 
     def test_retries_without_year_when_no_results(self, monkeypatch):
-        import core.movie_matcher as movie_matcher_module
+        import metamatch.movie_matcher as movie_matcher_module
         calls = []
 
         def fake_search(title, year, limit=5):
