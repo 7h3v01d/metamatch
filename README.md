@@ -123,8 +123,8 @@ one piece, without pulling in the stateful library classes at all — see
 
 ## Using it
 
-1. Paste a folder path into the box (e.g. `/Users/you/Music`) and click
-   **Scan folder**.
+1. Type or paste a folder path into the box (e.g. `/Users/you/Music`), or
+   click **Browse…** to navigate to it visually, then click **Scan folder**.
 2. Click **Find matches** — this queries MusicBrainz for every file found.
    MusicBrainz asks unauthenticated clients to stay around 1 request/second,
    so a library of a few hundred tracks will take a few minutes; progress
@@ -177,11 +177,21 @@ one piece, without pulling in the stateful library classes at all — see
   blend of fuzzy text, duration/year, and (for movies) TMDB search
   relevance ordering — it does not factor in a movie's popularity/rating,
   since that's evidence of nothing about *which* movie a file actually is.
-- `apply()` re-checks a file's size and modification time against what
-  was recorded at scan time before touching it, and refuses (with a
-  clear error) if something replaced or modified the file at that path
-  in the meantime — e.g. another program writing to it, or a very stale
-  scan. Rescan to clear the error.
+- `apply()` and `quarantine()` both re-check a file's size and
+  modification time against what was recorded at scan time before
+  touching it, and refuse (with a clear error) if something replaced or
+  modified the file at that path in the meantime — e.g. another program
+  writing to it, or a very stale scan. Rescan to clear the error.
+- **Browse…** is a small in-app folder picker, not your OS's native file
+  dialog — browsers deliberately don't expose real filesystem paths from
+  `<input type="file">` (even with a folder picked, JS only sees relative
+  names), so there's no way to hand an absolute path to the backend
+  through a native picker. The in-app browser calls a small read-only
+  `/api/browse` endpoint that lists subdirectories of wherever you are
+  and lets you navigate — reasonable here since this is a local
+  single-user tool where the scan endpoint already accepts any
+  filesystem path you name; browsing doesn't expose anything scanning
+  didn't already implicitly allow.
 - Quarantine only ever accepts files that the current scan itself
   discovered — not arbitrary paths — and the `_metamatch_duplicates`
   folder it creates is excluded from future scans of the same directory.
@@ -193,13 +203,66 @@ one piece, without pulling in the stateful library classes at all — see
 - CSV exports neutralize values that would be interpreted as spreadsheet
   formulas (`=`, `+`, `-`, `@` prefixes) since matched metadata and
   filenames are untrusted external text by the time they reach a CSV cell.
-- State (scanned folder, match results, undo history) lives in memory
-  while `app.py`/a `MusicLibrary`/`MovieLibrary` instance is running and
-  is lost on restart — there's no persistent transaction log, so a crash
-  mid-operation can't be recovered from automatically (the underlying
-  file operations are individually safe - fail-closed remux, fingerprint
-  checks, collision-safe renames - but there's no cross-operation undo
-  journal spanning a restart).
+- State (scanned folder, match results) lives in memory while
+  `app.py`/a `MusicLibrary`/`MovieLibrary` instance is running and is
+  lost on restart — you'll need to rescan a folder after restarting.
+  Apply/undo history is different: it's backed by a persistent journal
+  (see "Undo history and crash recovery" below), so it survives a
+  restart even though the scan results themselves don't.
+
+## Undo history and crash recovery
+
+Every `apply()` writes to a small SQLite journal (`~/.metamatch/journal.sqlite`
+by default) *before* touching any file, then marks that entry committed
+or failed once the operation finishes. This means:
+
+- **Undo survives a restart.** Close MetaMatch, reopen it, rescan the
+  same folder, and files you applied a match to earlier still show
+  "Undo" as available — the button isn't reading in-memory state that
+  reset when the process restarted, it's reading the journal.
+- **A crash mid-operation is detected, not silently lost.** If the
+  process dies between starting an apply and finishing it (a kill, a
+  power loss, a segfault — anything short of a clean exit), that
+  transaction is left in a "pending" state. The next time a
+  `MusicLibrary`/`MovieLibrary` is constructed (i.e. next time you start
+  the app), it checks for exactly this and marks any such transactions
+  "interrupted." The web UI shows this as a dismissible banner across
+  the top of the page listing which files may have been affected — worth
+  a manual check, since the interrupted operation's outcome is unknown
+  (it might have finished the file write and died before recording that,
+  or died before writing anything at all).
+- **Repeated applies to the same file always chain back to the true
+  original**, not to whatever the last apply changed it to — this was
+  true before the journal too (see the double-apply fix mentioned
+  above), but it's now enforced at the persistence layer instead of an
+  in-memory dict, so it holds across restarts too.
+
+What this is *not*: a fully atomic transaction system. A crash between
+writing a tag and renaming a file can still leave that one file
+half-updated — true atomicity there would mean staging every write to a
+temp file and swapping it in at the very end, which `tagger.py`/
+`movie_tagger.py` don't do for every operation (some individual steps,
+like the ffmpeg remux path, already do this — see "Movie matching"
+below). What the journal guarantees is that MetaMatch itself never loses
+track of *what it was trying to do* to *which file*, even across a
+crash, which is what makes both persistent undo and recovery detection
+possible.
+
+If you use `MusicLibrary`/`MovieLibrary` directly as a library (see
+above), you can point multiple instances at the same journal file to
+share undo history between them, or give each its own path for
+isolation — pass a `metamatch.journal.Journal(path)` instance to either
+constructor:
+
+```python
+from metamatch import MusicLibrary
+from metamatch.journal import Journal
+
+lib = MusicLibrary(journal=Journal("/custom/path/journal.sqlite"))
+notices = lib.get_recovery_notices()  # anything interrupted last run
+if notices:
+    print(f"{len(notices)} operation(s) may have been interrupted last run")
+```
 
 ## Project layout
 
@@ -208,6 +271,7 @@ metamatch/                (repo root)
   metamatch/                 The library - importable on its own, no Flask dependency
     __init__.py                 Public API: MusicLibrary, MovieLibrary
     library.py                    MusicLibrary/MovieLibrary - the stateful orchestration layer
+    journal.py                      Persistent write-ahead undo/crash-recovery log (SQLite)
     scanner.py                      Music: folder walking, tag reading, filename parsing
     matcher.py                        Music: MusicBrainz search + confidence scoring
     tagger.py                           Music: tag writing, cover art embedding, renaming
@@ -278,14 +342,19 @@ they're organized are different:
   same way as music: rename/tag reverts, an **Undo all applied** button,
   and a **Duplicates** panel (exact file hash + probable same-TMDB-movie
   grouping) that quarantines flagged videos *and* their `.nfo`/poster
-  sidecars together into `_metamatch_duplicates`. One real limitation:
-  undo can only remove a `.nfo`/poster it created itself — if one already
-  existed before you applied a match, undo restores its filename but not
-  its original content (there's no snapshot of what was there before).
-  Embedded-tag reverts are reliable for `.mp4`/`.m4v` (direct atom edit);
-  for `.mkv`/`.avi`/`.mov`/`.wmv` the embed goes through an `ffmpeg`
-  remux that isn't cheaply reversible, so those tags are left as-is on
-  undo - the same tradeoff as music's cover-art embedding.
+  sidecars together into `_metamatch_duplicates`. If a `.nfo`/poster
+  already existed before you applied a match, undo restores its actual
+  original bytes (not just its filename) — snapshotted before the apply
+  overwrote it, with a size cap (8MB) past which undo falls back to
+  leaving the file alone rather than guessing at content it never saved.
+  Sidecar paths after a rename-time naming collision (an unrelated file
+  already sitting at the name a match would naturally produce) are
+  tracked exactly, not reconstructed by guessing from the final filename
+  — a guess can land on someone else's file. Embedded-tag reverts are
+  reliable for `.mp4`/`.m4v` (direct atom edit); for
+  `.mkv`/`.avi`/`.mov`/`.wmv` the embed goes through an `ffmpeg` remux
+  that isn't cheaply reversible, so those tags are left as-is on undo -
+  the same tradeoff as music's cover-art embedding.
 
 ## Running the tests
 
@@ -294,7 +363,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-224 tests covering both the music and movie sides: filename/tag parsing,
+265 tests covering both the music and movie sides: filename/tag parsing,
 match-scoring math, tag writing and cover-art/poster embedding, renaming,
 undo (including the "don't delete a sidecar that already existed"
 edge case), duplicate detection and quarantine, TMDB key storage, the
@@ -330,7 +399,8 @@ tests/
   test_movie_matcher.py      TMDB scoring math
   test_movie_tagger.py         Rename, .nfo, poster, embedded metadata
   test_config.py                 TMDB key storage
-  test_library.py                  MusicLibrary/MovieLibrary used directly, no Flask
+  test_journal.py                  Persistent write-ahead journal, in isolation
+  test_library.py                    MusicLibrary/MovieLibrary used directly, no Flask
   test_app_music.py                  Music Flask routes, end to end
   test_app_movies.py                   Movie Flask routes, end to end
   test_hardening.py                      Regressions for an adversarial security/robustness review

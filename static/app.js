@@ -791,3 +791,108 @@ scanDupesBtn.addEventListener("click", async () => {
     scanDupesBtn.disabled = false;
   }
 });
+
+/* ---------------------------- Crash recovery ---------------------------- */
+
+async function checkRecoveryNotices() {
+  try {
+    const resp = await fetch("/api/recovery");
+    const data = await resp.json();
+    const all = [...(data.music || []), ...(data.movies || [])];
+    if (all.length === 0) return;
+
+    const banner = el("recoveryBanner");
+    const title = el("recoveryBannerTitle");
+    const detail = el("recoveryBannerDetail");
+
+    title.textContent = `${all.length} operation${all.length === 1 ? "" : "s"} may have been interrupted by a crash or restart`;
+    const fileList = all.slice(0, 5).map(n => n.original_path.split("/").pop()).join(", ");
+    const more = all.length > 5 ? ` and ${all.length - 5} more` : "";
+    detail.textContent = `MetaMatch was closed mid-operation on: ${fileList}${more}. Worth checking these files' tags/filenames by hand — their last apply may or may not have finished.`;
+    banner.hidden = false;
+  } catch (e) {
+    // a failed recovery check shouldn't block the rest of the UI from loading
+  }
+}
+
+el("recoveryBannerDismiss").addEventListener("click", () => {
+  el("recoveryBanner").hidden = true;
+});
+
+checkRecoveryNotices();
+
+/* --------------------------- Folder browser --------------------------- */
+
+const browseModalOverlay = el("browseModalOverlay");
+const browseModalClose = el("browseModalClose");
+const browsePath = el("browsePath");
+const browseList = el("browseList");
+const browseStatus = el("browseStatus");
+const browseSelectBtn = el("browseSelectBtn");
+
+let browseTargetInput = null;  // which text input Select fills in
+let browseCurrentPath = null;
+
+function openBrowseModal(targetInput) {
+  browseTargetInput = targetInput;
+  browseModalOverlay.hidden = false;
+  loadBrowsePath(targetInput.value.trim() || null);
+}
+
+function closeBrowseModal() {
+  browseModalOverlay.hidden = true;
+  browseTargetInput = null;
+}
+
+async function loadBrowsePath(path) {
+  browseStatus.textContent = "";
+  browseList.innerHTML = `<p class="browse-empty">Loading&hellip;</p>`;
+  try {
+    const params = path ? `?path=${encodeURIComponent(path)}` : "";
+    const resp = await fetch(`/api/browse${params}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Could not browse that folder.");
+
+    browseCurrentPath = data.path;
+    browsePath.textContent = data.path;
+    renderBrowseList(data);
+  } catch (e) {
+    browseList.innerHTML = "";
+    browseStatus.textContent = e.message;
+  }
+}
+
+function renderBrowseList(data) {
+  let html = "";
+  if (data.parent) {
+    html += `<button class="browse-item parent-item" data-path="${escapeHtml(data.parent)}"><span class="browse-item-icon">&uarr;</span> .. (up)</button>`;
+  }
+  if (data.directories.length === 0 && !data.parent) {
+    html += `<p class="browse-empty">No subfolders here.</p>`;
+  } else {
+    html += data.directories.map(name => {
+      const fullPath = data.path.endsWith("/") || data.path.endsWith("\\") ? data.path + name : data.path + "/" + name;
+      return `<button class="browse-item" data-path="${escapeHtml(fullPath)}"><span class="browse-item-icon">&#128193;</span> ${escapeHtml(name)}</button>`;
+    }).join("");
+  }
+  browseList.innerHTML = html;
+
+  browseList.querySelectorAll(".browse-item").forEach(btn => {
+    btn.addEventListener("click", () => loadBrowsePath(btn.dataset.path));
+  });
+}
+
+browseModalClose.addEventListener("click", closeBrowseModal);
+browseModalOverlay.addEventListener("click", (e) => {
+  if (e.target === browseModalOverlay) closeBrowseModal();
+});
+
+browseSelectBtn.addEventListener("click", () => {
+  if (browseTargetInput && browseCurrentPath) {
+    browseTargetInput.value = browseCurrentPath;
+  }
+  closeBrowseModal();
+});
+
+el("browseBtn").addEventListener("click", () => openBrowseModal(folderInput));
+el("movieBrowseBtn").addEventListener("click", () => openBrowseModal(movieFolderInput));

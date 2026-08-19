@@ -46,6 +46,7 @@ Movie flow (needs a TMDB API key - see /api/settings/tmdb):
 from __future__ import annotations
 
 import io
+import os
 
 from flask import Flask, jsonify, request, render_template, send_file, Response
 
@@ -53,13 +54,14 @@ from metamatch import MusicLibrary, MovieLibrary
 from metamatch.art import fetch_cover_art
 from metamatch.movie_matcher import TmdbNotConfigured
 from metamatch import config as app_config
+from metamatch.journal import Journal
 
 app = Flask(__name__)
 
 # One shared session per process - see the module docstring for why a
 # multi-user host would want one pair of these per user/session instead.
 music_library = MusicLibrary()
-movie_library = MovieLibrary()
+movie_library = MovieLibrary(journal=music_library.journal)  # one shared journal file for both
 
 
 @app.before_request
@@ -85,6 +87,57 @@ def _reject_cross_origin_mutations():
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/api/browse")
+def api_browse():
+    """Lists subdirectories of a path, for the folder-picker in the UI.
+
+    This is a local single-user tool where /api/scan already accepts any
+    filesystem path the caller names - browsing doesn't expose anything
+    scan didn't already implicitly allow, it's just a friendlier way to
+    find one. Read-only: no file contents, directory names only, and
+    entries this process can't access are skipped rather than raising.
+    """
+    requested = (request.args.get("path") or "").strip()
+    current = os.path.abspath(requested) if requested else os.path.expanduser("~")
+
+    if not os.path.isdir(current):
+        # Fall back to home rather than erroring, so a stale/invalid path
+        # saved from a previous session doesn't strand the picker.
+        current = os.path.expanduser("~")
+
+    entries = []
+    try:
+        with os.scandir(current) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False) and not entry.name.startswith("."):
+                        entries.append(entry.name)
+                except OSError:
+                    continue  # unreadable entry (permissions, broken symlink, etc.) - skip it
+    except OSError as e:
+        return jsonify({"error": f"Can't read that folder: {e}"}), 400
+
+    entries.sort(key=str.lower)
+    parent = os.path.dirname(current)
+    return jsonify({
+        "path": current,
+        "parent": parent if parent != current else None,
+        "directories": entries,
+    })
+
+
+@app.route("/api/recovery")
+def api_recovery():
+    """Transactions left mid-flight by a crash/kill before this process
+    started - each names a file whose last apply/undo may not have
+    finished. Checked once, at startup (see MusicLibrary/MovieLibrary's
+    constructor), not on every request."""
+    return jsonify({
+        "music": music_library.get_recovery_notices(),
+        "movies": movie_library.get_recovery_notices(),
+    })
 
 
 # ---------------------------------------------------------------------------

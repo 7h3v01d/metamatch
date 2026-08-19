@@ -138,8 +138,8 @@ class TestUndoBaselinePreservedThroughRepeatedApply:
         r1 = lib.apply(target["id"], do_tag=True, do_rename=True)
         r2 = lib.apply(r1["new_path"], do_tag=True, do_rename=True)  # accidental double apply
 
-        record = lib.undo_by_path[r2["new_path"]]
-        assert record["original_path"] == original_path
+        record = lib.journal.get_active_for_path("music", r2["new_path"])
+        assert record.original_path == original_path
 
         undo_result = lib.undo(r2["new_path"])
         assert undo_result["error"] is None
@@ -159,7 +159,7 @@ class TestUndoBaselinePreservedThroughRepeatedApply:
         r2 = lib.apply(r1["new_path"], do_tag=True, do_rename=True)
         r3 = lib.apply(r2["new_path"], do_tag=True, do_rename=True)
 
-        assert lib.undo_by_path[r3["new_path"]]["original_path"] == original_path
+        assert lib.journal.get_active_for_path("music", r3["new_path"]).original_path == original_path
 
 
 @requires_ffmpeg
@@ -729,6 +729,347 @@ class TestToctouFingerprintCheck:
         check is a best-effort safety net, not a hard requirement."""
         from metamatch.library import _fingerprint_changed
         assert _fingerprint_changed("/any/path", None, None) is False
+
+
+@requires_ffmpeg
+class TestPersistentUndoAcrossRestarts:
+    """The whole point of the journal: undo history and successful undo
+    both survive a full process restart, not just an in-memory session."""
+
+    def test_undo_history_visible_after_simulated_restart(self, music_dir, mock_music_match, tmp_path):
+        from metamatch import MusicLibrary
+        from metamatch.journal import Journal
+
+        journal_path = str(tmp_path / "restart_test.sqlite")
+
+        # "Session 1"
+        lib1 = MusicLibrary(journal=Journal(journal_path))
+        lib1.scan(str(music_dir))
+        lib1.match()
+        target = [t for t in lib1.tracks_payload() if t["tag_artist"] == "Radiohead"][0]
+        apply_result = lib1.apply(target["id"], do_tag=True, do_rename=True)
+        applied_path = apply_result["new_path"]
+        del lib1  # simulate the process exiting
+
+        # "Session 2" - brand new Library, brand new Journal object, same file
+        lib2 = MusicLibrary(journal=Journal(journal_path))
+        lib2.scan(str(music_dir))
+        payload = [t for t in lib2.tracks_payload() if t["id"] == applied_path]
+        assert len(payload) == 1
+        assert payload[0]["can_undo"] is True
+
+        undo_result = lib2.undo(applied_path)
+        assert undo_result["error"] is None
+        assert os.path.exists(target["id"])  # original filename restored
+
+    def test_movie_undo_history_visible_after_restart(self, movie_dir, mock_movie_match, mock_poster_download,
+                                                        isolated_config, tmp_path):
+        isolated_config.set_tmdb_api_key("test-key")
+        from metamatch import MovieLibrary
+        from metamatch.journal import Journal
+
+        journal_path = str(tmp_path / "movie_restart.sqlite")
+        lib1 = MovieLibrary(journal=Journal(journal_path))
+        lib1.scan(str(movie_dir))
+        lib1.match()
+        target = [v for v in lib1.videos_payload() if v["filename"] == "sample_movie.mp4"][0]
+        apply_result = lib1.apply(target["id"], do_tag=False, do_rename=True, do_nfo=True, do_poster=True)
+        del lib1
+
+        lib2 = MovieLibrary(journal=Journal(journal_path))
+        lib2.scan(str(movie_dir))
+        payload = [v for v in lib2.videos_payload() if v["id"] == apply_result["new_path"]]
+        assert payload[0]["can_undo"] is True
+
+        undo_result = lib2.undo(apply_result["new_path"])
+        assert undo_result["error"] is None
+
+
+@requires_ffmpeg
+class TestCrashRecoveryDetection:
+    """A transaction that never got a commit()/fail() call - the process
+    died mid-apply - must be detected and reported on the next startup,
+    not silently forgotten."""
+
+    def test_pending_transaction_surfaced_as_recovery_notice(self, tmp_path):
+        from metamatch import MusicLibrary
+        from metamatch.journal import Journal
+
+        journal_path = str(tmp_path / "crash.sqlite")
+        # Simulate a crash: begin() a transaction directly (as apply() would,
+        # before touching any file), then never commit/fail it.
+        crashed_journal = Journal(journal_path)
+        txn_id = crashed_journal.begin("music", "/tmp/x.mp3", "/tmp/x.mp3", {"artist": "Orig"}, {"do_tag": True})
+        del crashed_journal
+
+        lib = MusicLibrary(journal=Journal(journal_path))
+        notices = lib.get_recovery_notices()
+        assert len(notices) == 1
+        assert notices[0]["id"] == txn_id
+        assert notices[0]["status"] == "interrupted"
+        assert notices[0]["original_path"] == "/tmp/x.mp3"
+
+    def test_recovery_notice_only_surfaced_once(self, tmp_path):
+        from metamatch import MusicLibrary
+        from metamatch.journal import Journal
+
+        journal_path = str(tmp_path / "crash2.sqlite")
+        Journal(journal_path).begin("music", "/tmp/x.mp3", "/tmp/x.mp3", {}, {})
+
+        first_startup = MusicLibrary(journal=Journal(journal_path))
+        assert len(first_startup.get_recovery_notices()) == 1
+
+        second_startup = MusicLibrary(journal=Journal(journal_path))
+        assert second_startup.get_recovery_notices() == []
+
+    def test_committed_transactions_never_show_as_recovery_notices(self, music_dir, mock_music_match, tmp_path):
+        from metamatch import MusicLibrary
+        from metamatch.journal import Journal
+
+        journal_path = str(tmp_path / "clean.sqlite")
+        lib1 = MusicLibrary(journal=Journal(journal_path))
+        lib1.scan(str(music_dir))
+        lib1.match()
+        lib1.apply(lib1.order[0], do_tag=True, do_rename=False)  # completes normally
+        del lib1
+
+        lib2 = MusicLibrary(journal=Journal(journal_path))
+        assert lib2.get_recovery_notices() == []
+
+    def test_recovery_endpoint_via_flask(self, app_client, tmp_path):
+        from metamatch.journal import Journal
+        import app as app_module
+
+        Journal(app_module.music_library.journal.path).begin(
+            "music", "/tmp/y.mp3", "/tmp/y.mp3", {}, {"do_tag": True},
+        )
+        # app_client already constructed music_library before this txn was
+        # written, so simulate a fresh startup's recovery check directly:
+        app_module.music_library.recovered_transactions = app_module.music_library.journal.recover("music")
+
+        resp = app_client.get("/api/recovery")
+        data = resp.get_json()
+        assert len(data["music"]) == 1
+
+
+@requires_ffmpeg
+class TestJournalSupersessionPreventsPhantomEntries:
+    """A chained double-apply must supersede the earlier transaction so it
+    doesn't linger as a phantom 'undoable' entry pointing at a file that
+    no longer exists at that path (see journal.py Supersession tests for
+    the lower-level version of this)."""
+
+    def test_undo_all_does_not_include_superseded_stale_entries(self, music_dir, mock_music_match):
+        from metamatch import MusicLibrary
+
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        lib.match()
+        target = lib.order[0]
+
+        r1 = lib.apply(target, do_tag=True, do_rename=True)
+        lib.apply(r1["new_path"], do_tag=True, do_rename=True)  # chains + supersedes r1's transaction
+
+        undoable = lib.journal.list_undoable("music", folder=str(music_dir))
+        # exactly one live entry per applied file, not one per apply() call
+        current_paths = {t.current_path for t in undoable}
+        assert len(undoable) == len(current_paths)
+
+
+class TestHiddenAttributeNotOverriddenByDisplayCss:
+    """A `.some-class { display: flex/grid }` rule silently beats the
+    browser's default `[hidden] { display: none }` for any element that
+    has both `hidden` and that class - author styles win over user-agent
+    styles in the cascade regardless of selector specificity. This bit
+    the recovery banner (and, it turned out, the progress/apply-row
+    elements too): they rendered visible-but-empty on every page load
+    instead of actually staying hidden. Parses the real template/CSS on
+    disk so a future class added to a `hidden` element without a
+    `[hidden]` override gets caught here instead of shipping."""
+
+    def test_every_class_on_a_hidden_element_has_a_hidden_override_if_it_sets_display(self):
+        import re
+        from pathlib import Path
+
+        base = Path(__file__).parent.parent
+        html = (base / "templates" / "index.html").read_text()
+        css = (base / "static" / "style.css").read_text()
+
+        hidden_elements = re.findall(r'class="([^"]*)"[^>]*\bhidden\b', html)
+        hidden_elements += re.findall(r'\bhidden\b[^>]*class="([^"]*)"', html)
+        all_classes = set()
+        for classes in hidden_elements:
+            all_classes.update(classes.split())
+
+        assert all_classes, "sanity check: the template should have at least one hidden element with a class"
+
+        offenders = []
+        for cls in sorted(all_classes):
+            display_rule = re.search(rf'\.{re.escape(cls)}\s*{{[^}}]*display:\s*(\w+)', css)
+            if not display_rule:
+                continue  # no display: override for this class - nothing to conflict with [hidden]
+            has_hidden_override = re.search(rf'\.{re.escape(cls)}\[hidden\]', css)
+            if not has_hidden_override:
+                offenders.append((cls, display_rule.group(1)))
+
+        assert offenders == [], (
+            f"These classes set display:<value> and are used on a `hidden` element, but have no "
+            f"`.class[hidden] {{ display: none }}` override, so `hidden` will be silently ignored: {offenders}"
+        )
+
+
+@requires_ffmpeg
+class TestMovieUndoDoesNotDeleteCollidingUnrelatedSidecar:
+    """The composition bug: safe video rename + safe sidecar collision
+    handling + undo reconstructing sidecar paths from scratch instead of
+    using what was actually recorded = deleting a file MetaMatch never
+    touched. Fixed by recording the exact sidecar paths an apply produced
+    (journal after_state) instead of guessing them at undo time from the
+    current video filename."""
+
+    def _setup_collision(self, movie_dir, mock_movie_match, isolated_config, monkeypatch):
+        isolated_config.set_tmdb_api_key("test-key")
+        # The shared mock_movie_match fixture returns title "Test Movie" -
+        # override it here so the match actually resolves to "Film (2020)",
+        # matching the collision filenames planted below (otherwise the
+        # rename target wouldn't collide with anything and this test would
+        # silently stop testing what it claims to).
+        import metamatch.movie_matcher as movie_matcher_module
+        from conftest import make_fake_movie_match
+        monkeypatch.setattr(
+            movie_matcher_module, "find_best_match",
+            lambda video: make_fake_movie_match(title="Film", tmdb_id=1),
+        )
+
+        # Force BOTH the video AND the sidecar's naive target name to
+        # already be taken by something unrelated, so the sidecar has to
+        # land at a doubly-suffixed name distinct from what undo would
+        # naively reconstruct from the final video name.
+        (movie_dir / "Film (2020).mp4").write_bytes(b"unrelated other movie")
+        (movie_dir / "Film (2020) (2).nfo").write_text("UNRELATED NFO - DO NOT TOUCH")
+
+        from metamatch import MovieLibrary
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = [v for v in lib.videos_payload() if v["filename"] == "sample_movie.mp4"][0]
+        return lib, target
+
+    def test_movie_undo_does_not_delete_colliding_unrelated_nfo(self, movie_dir, mock_movie_match, isolated_config, monkeypatch):
+        lib, target = self._setup_collision(movie_dir, mock_movie_match, isolated_config, monkeypatch)
+        unrelated_nfo = movie_dir / "Film (2020) (2).nfo"
+
+        apply_result = lib.apply(target["id"], do_tag=False, do_rename=True, do_nfo=True, do_poster=False)
+        assert unrelated_nfo.exists()  # sanity: still there right after apply
+
+        lib.undo(apply_result["new_path"])
+
+        assert unrelated_nfo.exists(), "undo deleted a file it never created"
+        assert unrelated_nfo.read_text() == "UNRELATED NFO - DO NOT TOUCH"
+
+    def test_movie_undo_removes_actual_collision_safe_nfo(self, movie_dir, mock_movie_match, isolated_config, monkeypatch):
+        lib, target = self._setup_collision(movie_dir, mock_movie_match, isolated_config, monkeypatch)
+
+        apply_result = lib.apply(target["id"], do_tag=False, do_rename=True, do_nfo=True, do_poster=False)
+        real_nfo_path = apply_result["nfo_path"]
+        assert real_nfo_path.endswith("Film (2020) (2) (2).nfo")
+        assert os.path.exists(real_nfo_path)
+
+        lib.undo(apply_result["new_path"])
+
+        assert not os.path.exists(real_nfo_path), "the sidecar MetaMatch actually created should be cleaned up"
+
+    def test_movie_undo_does_not_delete_colliding_unrelated_poster(self, movie_dir, mock_movie_match,
+                                                                     mock_poster_download, isolated_config, monkeypatch):
+        isolated_config.set_tmdb_api_key("test-key")
+        import metamatch.movie_matcher as movie_matcher_module
+        from conftest import make_fake_movie_match
+        monkeypatch.setattr(
+            movie_matcher_module, "find_best_match",
+            lambda video: make_fake_movie_match(title="Film", tmdb_id=1),
+        )
+        (movie_dir / "Film (2020).mp4").write_bytes(b"unrelated other movie")
+        (movie_dir / "Film (2020) (2)-poster.jpg").write_bytes(b"UNRELATED POSTER BYTES")
+
+        from metamatch import MovieLibrary
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = [v for v in lib.videos_payload() if v["filename"] == "sample_movie.mp4"][0]
+
+        unrelated_poster = movie_dir / "Film (2020) (2)-poster.jpg"
+        apply_result = lib.apply(target["id"], do_tag=False, do_rename=True, do_nfo=False, do_poster=True)
+        assert unrelated_poster.exists()
+
+        lib.undo(apply_result["new_path"])
+
+        assert unrelated_poster.exists(), "undo deleted an unrelated poster it never created"
+        assert unrelated_poster.read_bytes() == b"UNRELATED POSTER BYTES"
+
+    def test_after_state_recorded_on_commit(self, movie_dir, mock_movie_match, isolated_config):
+        """The underlying mechanism: a successful apply's journal transaction
+        must carry the real sidecar paths, not leave callers to guess them."""
+        isolated_config.set_tmdb_api_key("test-key")
+        from metamatch import MovieLibrary
+
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = lib.order[0]
+        apply_result = lib.apply(target, do_tag=False, do_rename=False, do_nfo=True, do_poster=False)
+
+        txn = lib.journal.get_active_for_path("movie", apply_result["new_path"])
+        assert txn.after_state["nfo_path"] == apply_result["nfo_path"]
+
+
+class TestQuarantineFingerprintCheck:
+    """quarantine() checks the caller supplied a path from the current
+    scan, but (until this fix) never verified the file at that path still
+    matches what was scanned - a file replaced at the same path between
+    scan and quarantine would get moved without anyone checking it's still
+    the same content that was actually flagged as a duplicate."""
+
+    def test_music_quarantine_refuses_tampered_file(self, music_dir):
+        import time
+        from metamatch import MusicLibrary
+
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        target = lib.order[0]
+
+        time.sleep(0.02)
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=880:duration=3", "-y", target],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+
+        result = lib.quarantine([target])
+        assert result["moved"] == 0
+        assert result["results"][0]["error"] is not None
+        assert os.path.exists(target)  # never moved
+
+    def test_music_quarantine_succeeds_when_untampered(self, music_dir):
+        from metamatch import MusicLibrary
+
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        result = lib.quarantine([lib.order[0]])
+        assert result["moved"] == 1
+
+    def test_movie_quarantine_refuses_tampered_file(self, movie_dir):
+        import time
+        from metamatch import MovieLibrary
+
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        target = [p for p in lib.order if p.endswith("sample_movie.mp4")][0]
+
+        time.sleep(0.02)
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=red:s=160x120:d=3",
+                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", target],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+
+        result = lib.quarantine([target])
+        assert result["moved"] == 0
+        assert os.path.exists(target)
 
 
 class TestCrossOriginRejection:

@@ -131,6 +131,20 @@ def isolated_config(tmp_path, monkeypatch):
     return app_config
 
 
+@pytest.fixture(autouse=True)
+def isolated_journal(tmp_path, monkeypatch):
+    """Every MusicLibrary()/MovieLibrary() construction opens a journal at
+    journal_module.DEFAULT_JOURNAL_PATH unless one is passed explicitly -
+    autouse here so no test (there are dozens across several files) needs
+    to remember to isolate it individually. Without this, the whole suite
+    would read and write the real ~/.metamatch/journal.sqlite."""
+    from metamatch import journal as journal_module
+
+    fake_path = str(tmp_path / "isolated_journal.sqlite")
+    monkeypatch.setattr(journal_module, "DEFAULT_JOURNAL_PATH", fake_path)
+    return fake_path
+
+
 # ---------------------------------------------------------------------------
 # Network mocks
 # ---------------------------------------------------------------------------
@@ -235,7 +249,7 @@ def mock_poster_download(monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def app_client(isolated_config, monkeypatch):
+def app_client(isolated_config, isolated_journal, monkeypatch):
     import app as app_module
     from metamatch import MusicLibrary, MovieLibrary
 

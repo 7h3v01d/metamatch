@@ -21,12 +21,24 @@ class TestScanRoute:
         resp = app_client.post("/api/scan", json={"folder": ""})
         assert resp.status_code == 400
 
-    def test_scan_resets_undo_state(self, app_client, music_dir):
+    def test_rescanning_preserves_undo_history(self, app_client, music_dir, mock_music_match, wait_for_progress):
+        """Undo history is journal-backed now, not reset by every scan - that's
+        the whole point of persistence: a file applied earlier still shows
+        can_undo=True after a rescan (or, in the real app, after a restart)."""
         app_client.post("/api/scan", json={"folder": str(music_dir)})
-        import app as app_module
-        app_module.music_library.undo_by_path["stale"] = {"fake": "record"}
+        app_client.post("/api/match/start")
+        wait_for_progress(app_client, "/api/match/progress")
+        tracks = app_client.get("/api/tracks").get_json()["tracks"]
+        target_id = tracks[0]["id"]
+
+        apply_result = app_client.post("/api/apply", json={"id": target_id, "tag": True, "rename": False}).get_json()
+        assert apply_result["error"] is None
+
+        # rescan the same folder - the applied file's undo history must survive
         app_client.post("/api/scan", json={"folder": str(music_dir)})
-        assert app_module.music_library.undo_by_path == {}
+        tracks_after = app_client.get("/api/tracks").get_json()["tracks"]
+        rescanned = [t for t in tracks_after if t["id"] == apply_result["new_path"]][0]
+        assert rescanned["can_undo"] is True
 
 
 @requires_ffmpeg
@@ -200,3 +212,53 @@ def test_index_page_loads(app_client):
     resp = app_client.get("/")
     assert resp.status_code == 200
     assert b"MetaMatch" in resp.data
+
+
+class TestBrowseRoute:
+    def test_defaults_to_home_directory(self, app_client):
+        import os
+        resp = app_client.get("/api/browse")
+        data = resp.get_json()
+        assert data["path"] == os.path.expanduser("~")
+
+    def test_lists_subdirectories_of_given_path(self, app_client, tmp_path):
+        (tmp_path / "alpha").mkdir()
+        (tmp_path / "beta").mkdir()
+        (tmp_path / "not_a_dir.txt").write_text("x")
+
+        resp = app_client.get("/api/browse", query_string={"path": str(tmp_path)})
+        data = resp.get_json()
+        assert sorted(data["directories"]) == ["alpha", "beta"]
+        assert "not_a_dir.txt" not in data["directories"]
+
+    def test_hides_dotfiles(self, app_client, tmp_path):
+        (tmp_path / ".hidden").mkdir()
+        (tmp_path / "visible").mkdir()
+
+        resp = app_client.get("/api/browse", query_string={"path": str(tmp_path)})
+        data = resp.get_json()
+        assert data["directories"] == ["visible"]
+
+    def test_parent_navigation(self, app_client, tmp_path):
+        child = tmp_path / "child"
+        child.mkdir()
+        resp = app_client.get("/api/browse", query_string={"path": str(child)})
+        data = resp.get_json()
+        assert data["parent"] == str(tmp_path)
+
+    def test_root_has_no_parent(self, app_client):
+        resp = app_client.get("/api/browse", query_string={"path": "/"})
+        data = resp.get_json()
+        assert data["parent"] is None
+
+    def test_invalid_path_falls_back_to_home_instead_of_erroring(self, app_client, tmp_path):
+        import os
+        resp = app_client.get("/api/browse", query_string={"path": str(tmp_path / "does_not_exist")})
+        assert resp.status_code == 200
+        assert resp.get_json()["path"] == os.path.expanduser("~")
+
+    def test_results_sorted_case_insensitively(self, app_client, tmp_path):
+        for name in ["Zebra", "apple", "Banana"]:
+            (tmp_path / name).mkdir()
+        resp = app_client.get("/api/browse", query_string={"path": str(tmp_path)})
+        assert resp.get_json()["directories"] == ["apple", "Banana", "Zebra"]

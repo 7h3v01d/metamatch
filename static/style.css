@@ -158,6 +158,41 @@ main {
   gap: 20px;
 }
 
+.recovery-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  background: rgba(226, 87, 76, 0.08);
+  border: 1px solid var(--red);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  margin-bottom: 4px;
+}
+/* An author-stylesheet display:flex rule on this class otherwise beats the
+   browser's own [hidden] { display: none } default, since author styles
+   take precedence over user-agent styles in the cascade regardless of
+   selector specificity - without this override, the banner renders
+   visible-but-empty on every page load instead of actually staying hidden
+   until JS has real recovery notices to show. */
+.recovery-banner[hidden] {
+  display: none;
+}
+.recovery-banner-text strong {
+  display: block;
+  color: var(--red);
+  font-size: 13.5px;
+  letter-spacing: 0.02em;
+  margin-bottom: 4px;
+}
+.recovery-banner-text p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  line-height: 1.6;
+}
+.recovery-banner .btn { flex-shrink: 0; }
+
 .panel {
   background: var(--panel);
   border: 1px solid var(--border-soft);
@@ -243,9 +278,11 @@ input[type="text"]::placeholder { color: var(--text-faint); }
   gap: 18px;
   flex-wrap: wrap;
 }
+.action-row[hidden] { display: none; }
 .apply-row { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border-soft); }
 
 .progress-wrap { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 200px; }
+.progress-wrap[hidden] { display: none; }
 .progress-track {
   flex: 1;
   height: 8px;
@@ -393,6 +430,115 @@ td { padding: 14px 18px; vertical-align: top; }
 .row-actions .btn { padding: 7px 12px; font-size: 12px; }
 .row-status { font-family: var(--font-mono); font-size: 11.5px; color: var(--green); margin-top: 6px; }
 .row-status.error { color: var(--red); }
+
+/* ---------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(6, 7, 8, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 24px;
+}
+.modal-overlay[hidden] { display: none; }
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  width: 100%;
+  max-width: 560px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.browse-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.browse-modal-header h2 {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: 0.03em;
+}
+.modal-close {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.modal-close:hover { color: var(--text); background: var(--panel-raised); }
+
+.browse-path {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--teal);
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border-soft);
+  word-break: break-all;
+  background: var(--panel-raised);
+}
+
+.browse-list {
+  overflow-y: auto;
+  flex: 1;
+  padding: 6px 0;
+  min-height: 200px;
+}
+.browse-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: 13.5px;
+  padding: 9px 20px;
+  cursor: pointer;
+}
+.browse-item:hover { background: var(--panel-raised); }
+.browse-item-icon {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  flex-shrink: 0;
+  width: 16px;
+}
+.browse-item.parent-item .browse-item-icon { color: var(--amber); }
+.browse-empty {
+  padding: 24px 20px;
+  color: var(--text-faint);
+  font-size: 13px;
+  font-family: var(--font-mono);
+}
+
+.browse-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  border-top: 1px solid var(--border-soft);
+}
+.browse-modal-footer .status-line { margin: 0; }
 
 /* ---------------------------------------------------------------------- */
 
