@@ -89,6 +89,17 @@ def index():
     return render_template("index.html")
 
 
+DRIVES_SENTINEL = "__drives__"
+
+
+def _list_windows_drives() -> list[str]:
+    """Every drive letter with something mounted at it, e.g. ['C:\\\\', 'D:\\\\']."""
+    if os.name != "nt":
+        return []
+    import string
+    return [f"{letter}:\\" for letter in string.ascii_uppercase if os.path.exists(f"{letter}:\\")]
+
+
 @app.route("/api/browse")
 def api_browse():
     """Lists subdirectories of a path, for the folder-picker in the UI.
@@ -98,8 +109,20 @@ def api_browse():
     scan didn't already implicitly allow, it's just a friendlier way to
     find one. Read-only: no file contents, directory names only, and
     entries this process can't access are skipped rather than raising.
+
+    On Windows there's no single filesystem root - C:\\'s parent is
+    itself - so navigating "up" from a drive root instead surfaces a
+    virtual "This PC" listing of every other drive letter, requested with
+    the DRIVES_SENTINEL path.
     """
     requested = (request.args.get("path") or "").strip()
+
+    if requested == DRIVES_SENTINEL:
+        return jsonify({
+            "path": "This PC", "parent": None,
+            "directories": _list_windows_drives(), "is_drive_list": True,
+        })
+
     current = os.path.abspath(requested) if requested else os.path.expanduser("~")
 
     if not os.path.isdir(current):
@@ -121,10 +144,17 @@ def api_browse():
 
     entries.sort(key=str.lower)
     parent = os.path.dirname(current)
+    if parent == current:
+        # At a drive root (Windows) or the filesystem root (POSIX). On
+        # Windows with more than one drive present, offer the drive list
+        # as "up" instead of a dead end.
+        parent = DRIVES_SENTINEL if len(_list_windows_drives()) > 1 else None
+
     return jsonify({
         "path": current,
-        "parent": parent if parent != current else None,
+        "parent": parent,
         "directories": entries,
+        "is_drive_list": False,
     })
 
 

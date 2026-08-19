@@ -853,8 +853,10 @@ async function loadBrowsePath(path) {
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "Could not browse that folder.");
 
-    browseCurrentPath = data.path;
+    browseCurrentPath = data.is_drive_list ? null : data.path;
     browsePath.textContent = data.path;
+    browseSelectBtn.disabled = data.is_drive_list;
+    browseSelectBtn.title = data.is_drive_list ? "Pick a drive first" : "";
     renderBrowseList(data);
   } catch (e) {
     browseList.innerHTML = "";
@@ -862,17 +864,26 @@ async function loadBrowsePath(path) {
   }
 }
 
+const BROWSE_DRIVES_SENTINEL = "__drives__";
+
 function renderBrowseList(data) {
   let html = "";
   if (data.parent) {
-    html += `<button class="browse-item parent-item" data-path="${escapeHtml(data.parent)}"><span class="browse-item-icon">&uarr;</span> .. (up)</button>`;
+    const upLabel = data.parent === BROWSE_DRIVES_SENTINEL ? ".. (This PC)" : ".. (up)";
+    html += `<button class="browse-item parent-item" data-path="${escapeHtml(data.parent)}"><span class="browse-item-icon">&uarr;</span> ${upLabel}</button>`;
   }
   if (data.directories.length === 0 && !data.parent) {
     html += `<p class="browse-empty">No subfolders here.</p>`;
   } else {
     html += data.directories.map(name => {
-      const fullPath = data.path.endsWith("/") || data.path.endsWith("\\") ? data.path + name : data.path + "/" + name;
-      return `<button class="browse-item" data-path="${escapeHtml(fullPath)}"><span class="browse-item-icon">&#128193;</span> ${escapeHtml(name)}</button>`;
+      // A drive-list response's entries are already full paths ("D:\\"),
+      // unlike a normal directory listing where they're just names that
+      // need joining onto the current path.
+      const fullPath = data.is_drive_list
+        ? name
+        : (data.path.endsWith("/") || data.path.endsWith("\\") ? data.path + name : data.path + "/" + name);
+      const icon = data.is_drive_list ? "&#128189;" : "&#128193;";
+      return `<button class="browse-item" data-path="${escapeHtml(fullPath)}"><span class="browse-item-icon">${icon}</span> ${escapeHtml(name)}</button>`;
     }).join("");
   }
   browseList.innerHTML = html;

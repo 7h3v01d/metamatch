@@ -262,3 +262,94 @@ class TestBrowseRoute:
             (tmp_path / name).mkdir()
         resp = app_client.get("/api/browse", query_string={"path": str(tmp_path)})
         assert resp.get_json()["directories"] == ["apple", "Banana", "Zebra"]
+
+
+class TestBrowseWindowsDrives:
+    """Windows has no single filesystem root (C:\\'s parent is itself), so
+    navigating "up" from a drive root needs a virtual drive-list view
+    instead of a dead end. Simulated here via monkeypatching os.name/
+    os.path.exists since this suite normally runs on Linux/macOS."""
+
+    def _simulate_windows(self, monkeypatch, drives):
+        import os
+        monkeypatch.setattr(os, "name", "nt")
+        real_exists = os.path.exists
+
+        def fake_exists(p):
+            if p in drives:
+                return True
+            if any(p == d for d in drives):
+                return True
+            return real_exists(p)
+
+        monkeypatch.setattr(os.path, "exists", fake_exists)
+
+    def test_lists_multiple_drives(self, app_client, monkeypatch):
+        self._simulate_windows(monkeypatch, ["C:\\", "D:\\", "E:\\"])
+        import app as app_module
+        drives = app_module._list_windows_drives()
+        assert drives == ["C:\\", "D:\\", "E:\\"]
+
+    def test_non_windows_returns_no_drives(self, app_client, monkeypatch):
+        import os
+        monkeypatch.setattr(os, "name", "posix")
+        import app as app_module
+        assert app_module._list_windows_drives() == []
+
+    def test_drives_sentinel_returns_drive_list_response(self, app_client, monkeypatch):
+        self._simulate_windows(monkeypatch, ["C:\\", "D:\\"])
+        import app as app_module
+        resp = app_client.get("/api/browse", query_string={"path": app_module.DRIVES_SENTINEL})
+        data = resp.get_json()
+        assert data["is_drive_list"] is True
+        assert data["directories"] == ["C:\\", "D:\\"]
+        assert data["parent"] is None
+        assert data["path"] == "This PC"
+
+    def test_drive_root_parent_points_at_drives_sentinel_when_multiple_drives(self, app_client, monkeypatch, tmp_path):
+        # Simulate tmp_path itself acting as a "drive root": its dirname
+        # equals itself is the real trigger condition, which we can't
+        # fake for an arbitrary tmp_path, so instead verify the logic
+        # directly against a real POSIX root with multiple "drives" faked.
+        self._simulate_windows(monkeypatch, ["C:\\", "D:\\"])
+        import os
+        real_dirname = os.path.dirname
+        monkeypatch.setattr(os.path, "dirname", lambda p: p if p == "C:\\" else real_dirname(p))
+        # os.path.isdir also needs to accept "C:\\" as a real directory for this test
+        real_isdir = os.path.isdir
+        monkeypatch.setattr(os.path, "isdir", lambda p: True if p == "C:\\" else real_isdir(p))
+        real_abspath = os.path.abspath
+        monkeypatch.setattr(os.path, "abspath", lambda p: "C:\\" if p == "C:\\" else real_abspath(p))
+        real_scandir = os.scandir
+
+        class _EmptyScandir:
+            def __enter__(self): return iter([])
+            def __exit__(self, *a): return False
+
+        monkeypatch.setattr(os, "scandir", lambda p: _EmptyScandir() if p == "C:\\" else real_scandir(p))
+
+        import app as app_module
+        resp = app_client.get("/api/browse", query_string={"path": "C:\\"})
+        data = resp.get_json()
+        assert data["parent"] == app_module.DRIVES_SENTINEL
+
+    def test_drive_root_parent_is_none_with_only_one_drive(self, app_client, monkeypatch):
+        self._simulate_windows(monkeypatch, ["C:\\"])
+        import os
+        real_dirname = os.path.dirname
+        monkeypatch.setattr(os.path, "dirname", lambda p: p if p == "C:\\" else real_dirname(p))
+        real_isdir = os.path.isdir
+        monkeypatch.setattr(os.path, "isdir", lambda p: True if p == "C:\\" else real_isdir(p))
+        real_abspath = os.path.abspath
+        monkeypatch.setattr(os.path, "abspath", lambda p: "C:\\" if p == "C:\\" else real_abspath(p))
+        real_scandir = os.scandir
+
+        class _EmptyScandir:
+            def __enter__(self): return iter([])
+            def __exit__(self, *a): return False
+
+        monkeypatch.setattr(os, "scandir", lambda p: _EmptyScandir() if p == "C:\\" else real_scandir(p))
+
+        resp = app_client.get("/api/browse", query_string={"path": "C:\\"})
+        data = resp.get_json()
+        assert data["parent"] is None

@@ -191,7 +191,11 @@ one piece, without pulling in the stateful library classes at all — see
   and lets you navigate — reasonable here since this is a local
   single-user tool where the scan endpoint already accepts any
   filesystem path you name; browsing doesn't expose anything scanning
-  didn't already implicitly allow.
+  didn't already implicitly allow. On Windows, navigating "up" from a
+  drive root (e.g. `C:\`) shows a "This PC" list of every other drive
+  letter present, since Windows has no single filesystem root the way
+  `/` works on macOS/Linux — otherwise there'd be no way to reach `D:\`
+  once you'd browsed into `C:\`.
 - Quarantine only ever accepts files that the current scan itself
   discovered — not arbitrary paths — and the `_metamatch_duplicates`
   folder it creates is excluded from future scans of the same directory.
@@ -363,7 +367,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-265 tests covering both the music and movie sides: filename/tag parsing,
+270 tests covering both the music and movie sides: filename/tag parsing,
 match-scoring math, tag writing and cover-art/poster embedding, renaming,
 undo (including the "don't delete a sidecar that already existed"
 edge case), duplicate detection and quarantine, TMDB key storage, the
