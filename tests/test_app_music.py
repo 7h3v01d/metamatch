@@ -247,9 +247,19 @@ class TestBrowseRoute:
         assert data["parent"] == str(tmp_path)
 
     def test_root_has_no_parent(self, app_client):
+        import os
         resp = app_client.get("/api/browse", query_string={"path": "/"})
         data = resp.get_json()
-        assert data["parent"] is None
+        if os.name == "nt":
+            # On Windows, "/" resolves to the root of the current drive
+            # rather than a single POSIX-style universal root - if the
+            # machine has more than one drive, "up" from there correctly
+            # offers the drive-switcher (see TestBrowseWindowsDrives)
+            # instead of a dead end, so parent isn't necessarily None here.
+            import app as app_module
+            assert data["parent"] in (None, app_module.DRIVES_SENTINEL)
+        else:
+            assert data["parent"] is None
 
     def test_invalid_path_falls_back_to_home_instead_of_erroring(self, app_client, tmp_path):
         import os
@@ -272,14 +282,20 @@ class TestBrowseWindowsDrives:
 
     def _simulate_windows(self, monkeypatch, drives):
         import os
+        import re
         monkeypatch.setattr(os, "name", "nt")
         real_exists = os.path.exists
+        drive_pattern = re.compile(r"^[A-Za-z]:\\$")
 
         def fake_exists(p):
-            if p in drives:
-                return True
-            if any(p == d for d in drives):
-                return True
+            # Fully isolate drive-letter-root checks from whatever drives
+            # actually exist on the machine running the suite - falling
+            # back to the real os.path.exists() for *those specific*
+            # paths would let a dev box's real D:\, E:\, etc. leak into
+            # "only these fake drives exist" simulations. Non-drive paths
+            # still use the real check, since other code paths may need it.
+            if drive_pattern.match(str(p)):
+                return p in drives
             return real_exists(p)
 
         monkeypatch.setattr(os.path, "exists", fake_exists)
