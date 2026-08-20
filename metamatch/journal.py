@@ -92,6 +92,22 @@ class Transaction:
         }
 
 
+def _is_within(path: str, folder: str) -> bool:
+    """True filesystem containment - not a string prefix check. A plain
+    startswith(folder) would treat /tmp/music_backup as "within"
+    /tmp/music (they share a string prefix but are unrelated sibling
+    directories), which would let list_undoable()/undo_all() reach into a
+    completely different folder that merely has a similar name."""
+    try:
+        path_real = os.path.realpath(os.path.abspath(path))
+        folder_real = os.path.realpath(os.path.abspath(folder))
+        return os.path.commonpath([path_real, folder_real]) == folder_real
+    except ValueError:
+        # os.path.commonpath raises this for paths on different Windows
+        # drives (e.g. "C:\\..." vs "D:\\...") - definitionally not contained.
+        return False
+
+
 class Journal:
     """One journal can serve both MusicLibrary and MovieLibrary - rows are
     namespaced by `kind` ('music'/'movie') rather than needing two files."""
@@ -193,8 +209,7 @@ class Journal:
             ).fetchall()
         txns = [self._row_to_txn(r) for r in rows]
         if folder:
-            folder_norm = os.path.normpath(folder)
-            txns = [t for t in txns if os.path.normpath(t.current_path).startswith(folder_norm)]
+            txns = [t for t in txns if _is_within(t.current_path, folder)]
         return txns
 
     def find_incomplete(self, kind: str) -> list[Transaction]:

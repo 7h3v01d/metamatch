@@ -104,11 +104,76 @@ class TestListUndoable:
         assert len(results) == 1
         assert results[0].id == t1
 
+    def test_folder_filter_does_not_match_prefix_sibling(self, journal):
+        """A plain string startswith(folder) would wrongly treat
+        /music_backup as "within" /music, since they share a string
+        prefix while being unrelated sibling directories - this is the
+        containment bug an adversarial review caught: undo_all() scoped
+        to one library could reach into a same-prefixed sibling folder."""
+        t1 = journal.begin("music", "/music/a.mp3", "/music/a.mp3", {}, {})
+        journal.commit(t1, "/music/a.mp3")
+        t2 = journal.begin("music", "/music_backup/b.mp3", "/music_backup/b.mp3", {}, {})
+        journal.commit(t2, "/music_backup/b.mp3")
+
+        results = journal.list_undoable("music", folder="/music")
+        assert len(results) == 1
+        assert results[0].id == t1
+        assert not any("music_backup" in t.current_path for t in results)
+
+    def test_folder_filter_still_matches_real_subdirectories(self, journal):
+        """Sanity check the fix didn't overcorrect: genuine nested
+        contents of the scoped folder must still be included."""
+        t1 = journal.begin("music", "/music/album/track.mp3", "/music/album/track.mp3", {}, {})
+        journal.commit(t1, "/music/album/track.mp3")
+
+        results = journal.list_undoable("music", folder="/music")
+        assert len(results) == 1
+        assert results[0].id == t1
+
     def test_get_undoable_paths_matches_list(self, journal):
         t1 = journal.begin("music", "/a.mp3", "/a.mp3", {}, {})
         journal.commit(t1, "/renamed_a.mp3")
         paths = journal.get_undoable_paths("music")
         assert paths == {"/renamed_a.mp3"}
+
+
+class TestIsWithinContainment:
+    """Direct tests of the path-containment helper itself, independent of
+    the journal - see TestListUndoable for the integration-level version."""
+
+    def test_rejects_prefix_sibling(self):
+        from metamatch.journal import _is_within
+        assert _is_within("/tmp/music_backup/song.mp3", "/tmp/music") is False
+
+    def test_accepts_real_subdirectory(self):
+        from metamatch.journal import _is_within
+        assert _is_within("/tmp/music/album/song.mp3", "/tmp/music") is True
+
+    def test_accepts_direct_child(self):
+        from metamatch.journal import _is_within
+        assert _is_within("/tmp/music/song.mp3", "/tmp/music") is True
+
+    def test_rejects_unrelated_path(self):
+        from metamatch.journal import _is_within
+        assert _is_within("/var/log/song.mp3", "/tmp/music") is False
+
+    def test_handles_relative_and_dotted_paths(self):
+        from metamatch.journal import _is_within
+        assert _is_within("/tmp/music/../music_backup/song.mp3", "/tmp/music") is False
+        assert _is_within("/tmp/music/./album/song.mp3", "/tmp/music") is True
+
+    def test_different_windows_drives_never_match(self, monkeypatch):
+        """os.path.commonpath raises ValueError for paths on different
+        drives (e.g. C:\\ vs D:\\) - must be treated as "not contained",
+        not propagate the exception."""
+        import os
+        from metamatch.journal import _is_within
+
+        def fake_commonpath(paths):
+            raise ValueError("Paths don't have the same drive")
+
+        monkeypatch.setattr(os.path, "commonpath", fake_commonpath)
+        assert _is_within("D:\\Music\\song.mp3", "C:\\Music") is False
 
 
 class TestCrashRecovery:

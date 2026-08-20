@@ -240,6 +240,11 @@ or failed once the operation finishes. This means:
   true before the journal too (see the double-apply fix mentioned
   above), but it's now enforced at the persistence layer instead of an
   in-memory dict, so it holds across restarts too.
+- **"Undo all applied" only ever reaches files actually inside the
+  scanned folder.** It's scoped by real filesystem containment (via
+  `os.path.commonpath`), not a string-prefix check — a folder named
+  `Music_Backup` sitting next to `Music` won't get swept up just because
+  its name happens to start the same way.
 
 What this is *not*: a fully atomic transaction system. A crash between
 writing a tag and renaming a file can still leave that one file
@@ -367,7 +372,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-270 tests covering both the music and movie sides: filename/tag parsing,
+279 tests covering both the music and movie sides: filename/tag parsing,
 match-scoring math, tag writing and cover-art/poster embedding, renaming,
 undo (including the "don't delete a sidecar that already existed"
 edge case), duplicate detection and quarantine, TMDB key storage, the

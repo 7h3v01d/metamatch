@@ -876,6 +876,55 @@ class TestJournalSupersessionPreventsPhantomEntries:
         assert len(undoable) == len(current_paths)
 
 
+@requires_ffmpeg
+class TestJournalFolderContainmentNotPrefixMatch:
+    """undo_all() scopes to the current library's folder via
+    journal.list_undoable(folder=...) - a naive string-prefix check there
+    would let a sibling directory that merely shares a name prefix (e.g.
+    /music vs /music_backup) leak into scope, so an "Undo all applied" in
+    one library could revert files that were never part of it."""
+
+    def test_undo_all_does_not_reach_into_prefix_sibling_folder(self, tmp_path, mock_music_match):
+        import shutil
+        from metamatch import MusicLibrary
+
+        music_dir = tmp_path / "music"
+        backup_dir = tmp_path / "music_backup"  # shares a string prefix with "music"
+        music_dir.mkdir()
+        backup_dir.mkdir()
+
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                         str(music_dir / "song.mp3")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                         str(backup_dir / "other_song.mp3")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+
+        # Apply a match in the backup folder using its own Library instance
+        # sharing the same journal (as app.py's two libraries do).
+        backup_lib = MusicLibrary()
+        backup_lib.scan(str(backup_dir))
+        backup_lib.match()
+        backup_result = backup_lib.apply(backup_lib.order[0], do_tag=True, do_rename=False)
+        assert backup_result["error"] is None
+
+        # Now scan and apply in the real target folder, using a *different*
+        # Library instance that shares the same journal file.
+        from metamatch.journal import Journal
+        music_lib = MusicLibrary(journal=Journal(backup_lib.journal.path))
+        music_lib.scan(str(music_dir))
+        music_lib.match()
+        music_result = music_lib.apply(music_lib.order[0], do_tag=True, do_rename=False)
+        assert music_result["error"] is None
+
+        # Undo all, scoped to just the music folder - must not touch the
+        # backup folder's file even though the names collide as strings.
+        result = music_lib.undo_all()
+        assert result["restored"] == 1
+
+        from metamatch.scanner import read_track
+        backup_track = read_track(str(backup_dir / "other_song.mp3"))
+        assert backup_track.tag_artist == "Radiohead", "sibling folder's applied tag must survive undo_all() scoped elsewhere"
+
+
 class TestHiddenAttributeNotOverriddenByDisplayCss:
     """A `.some-class { display: flex/grid }` rule silently beats the
     browser's default `[hidden] { display: none }` for any element that
