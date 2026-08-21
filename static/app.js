@@ -582,6 +582,9 @@ async function undoMovieSingle(idx) {
     const data = await resp.json();
     if (!resp.ok || data.error) throw new Error(data.error || "Failed to undo.");
     showToast("Reverted " + (data.restored_path || "").split("/").pop());
+    if (data.warnings && data.warnings.length > 0) {
+      data.warnings.forEach(w => showToast(w, true));
+    }
     await refreshMovies();
   } catch (e) {
     showToast(e.message, true);

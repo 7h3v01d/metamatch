@@ -877,6 +877,204 @@ class TestJournalSupersessionPreventsPhantomEntries:
 
 
 @requires_ffmpeg
+@requires_ffmpeg
+class TestUndoStaleFileProtection:
+    """Undo must not blindly operate on a file just because a path was
+    recorded for it earlier - if something replaced the file at that path
+    since apply ran, undo should refuse (for the primary media file) or
+    skip (for a sidecar) rather than silently rewrite/delete unrelated
+    content. Same TOCTOU class apply() and quarantine() already guard
+    against, extended to undo."""
+
+    def test_music_undo_refuses_replaced_current_file(self, music_dir, mock_music_match):
+        import time
+        from metamatch import MusicLibrary
+
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        lib.match()
+        target = [t for t in lib.tracks_payload() if t["tag_artist"] == "Radiohead"][0]
+        result = lib.apply(target["id"], do_tag=True, do_rename=False)
+        assert result["error"] is None
+
+        time.sleep(0.02)
+        with open(result["new_path"], "wb") as f:
+            f.write(b"UNRELATED REPLACEMENT CONTENT")
+
+        undo_result = lib.undo(result["new_path"])
+        assert undo_result["error"] is not None
+        with open(result["new_path"], "rb") as f:
+            assert f.read() == b"UNRELATED REPLACEMENT CONTENT"
+
+    def test_music_undo_succeeds_when_untampered(self, music_dir, mock_music_match):
+        from metamatch import MusicLibrary
+
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        lib.match()
+        result = lib.apply(lib.order[0], do_tag=True, do_rename=False)
+        undo_result = lib.undo(result["new_path"])
+        assert undo_result["error"] is None
+
+    def test_undo_all_isolates_a_tampered_file_from_the_rest(self, music_dir, mock_music_match):
+        import time
+        from metamatch import MusicLibrary
+
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        lib.match()
+        apply_result = lib.apply_all(do_tag=True, do_rename=False, min_confidence=0)
+        assert apply_result["succeeded"] == 2
+
+        applied = lib.journal.list_undoable("music", folder=str(music_dir))
+        tamper_path = applied[0].current_path
+        time.sleep(0.02)
+        with open(tamper_path, "wb") as f:
+            f.write(b"TAMPERED")
+
+        undo_all_result = lib.undo_all()
+        assert undo_all_result["restored"] == 1
+        errors = [r["error"] for r in undo_all_result["results"] if r["error"]]
+        assert len(errors) == 1
+
+    def test_movie_undo_refuses_replaced_current_video(self, movie_dir, mock_movie_match, isolated_config):
+        import time
+        isolated_config.set_tmdb_api_key("test-key")
+        from metamatch import MovieLibrary
+
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = [v for v in lib.videos_payload() if v["filename"] == "sample_movie.mp4"][0]
+        result = lib.apply(target["id"], do_tag=False, do_rename=False, do_nfo=False, do_poster=False)
+        assert result["error"] is None
+
+        time.sleep(0.02)
+        with open(result["new_path"], "wb") as f:
+            f.write(b"UNRELATED REPLACEMENT VIDEO")
+
+        undo_result = lib.undo(result["new_path"])
+        assert undo_result["error"] is not None
+        with open(result["new_path"], "rb") as f:
+            assert f.read() == b"UNRELATED REPLACEMENT VIDEO"
+
+    def test_movie_undo_does_not_delete_replaced_nfo(self, movie_dir, mock_movie_match, isolated_config):
+        import time
+        isolated_config.set_tmdb_api_key("test-key")
+        from metamatch import MovieLibrary
+
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = [v for v in lib.videos_payload() if v["filename"] == "sample_movie.mp4"][0]
+        result = lib.apply(target["id"], do_tag=False, do_rename=False, do_nfo=True, do_poster=False)
+        assert result["error"] is None
+
+        time.sleep(0.02)
+        with open(result["nfo_path"], "w") as f:
+            f.write("REPLACED BY SOMETHING ELSE AFTER APPLY")
+
+        undo_result = lib.undo(result["new_path"])
+        assert undo_result["error"] is None  # video itself untouched, so undo still succeeds overall
+        assert any("nfo" in w.lower() for w in undo_result["warnings"])
+        with open(result["nfo_path"]) as f:
+            assert f.read() == "REPLACED BY SOMETHING ELSE AFTER APPLY"
+
+    def test_movie_undo_does_not_delete_replaced_poster(self, movie_dir, mock_movie_match, mock_poster_download, isolated_config):
+        import time
+        isolated_config.set_tmdb_api_key("test-key")
+        from metamatch import MovieLibrary
+
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = [v for v in lib.videos_payload() if v["filename"] == "sample_movie.mp4"][0]
+        result = lib.apply(target["id"], do_tag=False, do_rename=False, do_nfo=False, do_poster=True)
+        assert result["error"] is None
+
+        time.sleep(0.02)
+        with open(result["poster_path"], "wb") as f:
+            f.write(b"REPLACED POSTER BYTES")
+
+        undo_result = lib.undo(result["new_path"])
+        assert undo_result["error"] is None
+        assert any("poster" in w.lower() for w in undo_result["warnings"])
+        with open(result["poster_path"], "rb") as f:
+            assert f.read() == b"REPLACED POSTER BYTES"
+
+
+@requires_ffmpeg
+class TestLegacyMovieTransactionFailsClosedOnSidecars:
+    """A journal transaction written before exact sidecar-path tracking
+    existed has no reliable way to know where its sidecar really went (a
+    rename-time collision could have pushed it to an alternate suffixed
+    name) - guessing from the current filename risks the exact
+    unrelated-file-deletion bug this feature exists to prevent. Undo must
+    fail closed for these: skip sidecar handling entirely rather than guess."""
+
+    def test_legacy_transaction_does_not_touch_unrelated_colliding_nfo(self, movie_dir, mock_movie_match, isolated_config, monkeypatch):
+        import sqlite3
+        import json
+        isolated_config.set_tmdb_api_key("test-key")
+
+        # Plant an unrelated NFO at the exact path a naive (pre-fix) undo
+        # would reconstruct from the collision-safe renamed video name.
+        (movie_dir / "Film (2020).mp4").write_bytes(b"unrelated other movie")
+        (movie_dir / "Film (2020) (2).nfo").write_text("UNRELATED - NOT METAMATCH'S FILE")
+
+        import metamatch.movie_matcher as movie_matcher_module
+        from conftest import make_fake_movie_match
+        monkeypatch.setattr(movie_matcher_module, "find_best_match", lambda video: make_fake_movie_match(title="Film", tmdb_id=1))
+
+        from metamatch import MovieLibrary
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = [v for v in lib.videos_payload() if v["filename"] == "sample_movie.mp4"][0]
+        result = lib.apply(target["id"], do_tag=False, do_rename=True, do_nfo=False, do_poster=False)
+        assert result["error"] is None
+
+        # Simulate a transaction written before exact-path tracking existed
+        # by stripping those keys out of its stored after_state.
+        txn = lib.journal.get_active_for_path("movie", result["new_path"])
+        conn = sqlite3.connect(lib.journal.path)
+        legacy_state = {k: v for k, v in txn.after_state.items() if k not in ("nfo_path", "poster_path")}
+        conn.execute("UPDATE transactions SET after_state=? WHERE id=?", (json.dumps(legacy_state), txn.id))
+        conn.commit()
+        conn.close()
+
+        undo_result = lib.undo(result["new_path"])
+
+        assert undo_result["error"] is None
+        assert len(undo_result["warnings"]) == 1
+        assert "predates exact sidecar tracking" in undo_result["warnings"][0]
+        assert (movie_dir / "Film (2020) (2).nfo").read_text() == "UNRELATED - NOT METAMATCH'S FILE"
+
+    def test_legacy_transaction_still_restores_video_filename(self, movie_dir, mock_movie_match, isolated_config):
+        import sqlite3
+        import json
+        isolated_config.set_tmdb_api_key("test-key")
+        from metamatch import MovieLibrary
+
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = [v for v in lib.videos_payload() if v["filename"] == "sample_movie.mp4"][0]
+        original_path = target["id"]
+        result = lib.apply(target["id"], do_tag=False, do_rename=True, do_nfo=False, do_poster=False)
+
+        txn = lib.journal.get_active_for_path("movie", result["new_path"])
+        conn = sqlite3.connect(lib.journal.path)
+        legacy_state = {k: v for k, v in txn.after_state.items() if k not in ("nfo_path", "poster_path")}
+        conn.execute("UPDATE transactions SET after_state=? WHERE id=?", (json.dumps(legacy_state), txn.id))
+        conn.commit()
+        conn.close()
+
+        undo_result = lib.undo(result["new_path"])
+        assert undo_result["error"] is None
+        assert os.path.exists(original_path)
+
+
 class TestJournalFolderContainmentNotPrefixMatch:
     """undo_all() scopes to the current library's folder via
     journal.list_undoable(folder=...) - a naive string-prefix check there

@@ -108,6 +108,19 @@ def _fingerprint_changed(path: str, expected_size: Optional[int], expected_mtime
     return current.st_size != expected_size or current.st_mtime_ns != expected_mtime_ns
 
 
+def _file_fingerprint(path: Optional[str]) -> Optional[dict]:
+    """(size, mtime_ns) for a file that exists, or None - used to record
+    what a successful apply actually produced, so a later undo can verify
+    nothing replaced it in the meantime before touching it."""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+        return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    except OSError:
+        return None
+
+
 def _b64_or_none(data: Optional[bytes]) -> Optional[str]:
     return base64.b64encode(data).decode("ascii") if data is not None else None
 
@@ -281,7 +294,11 @@ class MusicLibrary:
         if result["error"]:
             self.journal.fail(txn_id, result["error"])
         else:
-            self.journal.commit(txn_id, result["new_path"])
+            after_state = None
+            media_fp = _file_fingerprint(result["new_path"])
+            if media_fp:
+                after_state = {"media_size": media_fp["size"], "media_mtime_ns": media_fp["mtime_ns"]}
+            self.journal.commit(txn_id, result["new_path"], after_state=after_state)
             if existing:
                 self.journal.mark_superseded(existing.id)
 
@@ -314,6 +331,18 @@ class MusicLibrary:
         current_path = txn.current_path
         original_path = txn.original_path
         result = {"restored_path": current_path, "error": None}
+
+        after_state = txn.after_state or {}
+        expected_size = after_state.get("media_size")
+        expected_mtime_ns = after_state.get("media_mtime_ns")
+        if _fingerprint_changed(current_path, expected_size, expected_mtime_ns):
+            result["error"] = (
+                "This file has changed since MetaMatch applied this match "
+                "(size/modification time no longer match) - undo refused to "
+                "avoid modifying a different file. Rescan if you still want to change it."
+            )
+            return result
+
         try:
             path_to_tag = current_path
             if current_path != original_path and os.path.exists(current_path):
@@ -594,8 +623,23 @@ class MovieLibrary:
             # collision can push a sidecar to an alternate suffixed name
             # (see movie_tagger._safe_move), and undo must operate on that
             # real path or risk deleting an unrelated file that happens to
-            # sit at the naively-expected name instead.
+            # sit at the naively-expected name instead. Fingerprints of
+            # each object as apply left them let undo verify later that
+            # nothing else has touched them since.
             after_state = {"nfo_path": result.get("nfo_path"), "poster_path": result.get("poster_path")}
+            media_fp = _file_fingerprint(result["new_path"])
+            if media_fp:
+                after_state["media_size"] = media_fp["size"]
+                after_state["media_mtime_ns"] = media_fp["mtime_ns"]
+            nfo_fp = _file_fingerprint(result.get("nfo_path"))
+            if nfo_fp:
+                after_state["nfo_size"] = nfo_fp["size"]
+                after_state["nfo_mtime_ns"] = nfo_fp["mtime_ns"]
+            poster_fp = _file_fingerprint(result.get("poster_path"))
+            if poster_fp:
+                after_state["poster_size"] = poster_fp["size"]
+                after_state["poster_mtime_ns"] = poster_fp["mtime_ns"]
+
             self.journal.commit(txn_id, result["new_path"], after_state=after_state)
             if existing:
                 self.journal.mark_superseded(existing.id)
@@ -629,7 +673,22 @@ class MovieLibrary:
         current_path = txn.current_path
         original_path = txn.original_path
         snapshot = txn.before_state
-        result = {"restored_path": current_path, "error": None}
+        after_state = txn.after_state or {}
+        result = {"restored_path": current_path, "error": None, "warnings": []}
+
+        # The video itself: refuse the whole undo if it's changed since
+        # apply produced it - same principle as apply()'s own TOCTOU guard,
+        # applied to undo. No fingerprint recorded (a transaction from
+        # before this check existed) means nothing to verify against, so
+        # it's allowed through rather than blocking all older undo history.
+        if _fingerprint_changed(current_path, after_state.get("media_size"), after_state.get("media_mtime_ns")):
+            result["error"] = (
+                "This file has changed since MetaMatch applied this match "
+                "(size/modification time no longer match) - undo refused to "
+                "avoid modifying a different file. Rescan if you still want to change it."
+            )
+            return result
+
         try:
             # Use the EXACT sidecar paths recorded when this apply ran
             # (see _apply_one) rather than reconstructing them from the
@@ -638,20 +697,38 @@ class MovieLibrary:
             # name, and guessing at "current basename + .nfo" can land on
             # that unrelated file instead of the one MetaMatch actually
             # created, deleting or overwriting something it never touched.
-            after_state = txn.after_state or {}
             has_exact_paths = "nfo_path" in after_state or "poster_path" in after_state
             if has_exact_paths:
                 nfo_current = after_state.get("nfo_path")
                 poster_current = after_state.get("poster_path")
             else:
                 # Transaction predates exact-path tracking (a journal from
-                # before this fix). Falls back to the old reconstruction,
-                # which is only correct when no rename-time collision
-                # occurred - there's no way to recover the real path for
-                # transactions written before it was tracked.
-                base_current = os.path.splitext(current_path)[0]
-                nfo_current = base_current + ".nfo"
-                poster_current = base_current + "-poster.jpg"
+                # before this fix) - there's no way to recover the real
+                # sidecar path for it, and guessing risks the exact
+                # unrelated-file deletion this feature exists to prevent.
+                # Fail closed: skip sidecar undo entirely for these rather
+                # than guess. The video filename/tags are still restored.
+                nfo_current = None
+                poster_current = None
+                result["warnings"].append(
+                    "This transaction predates exact sidecar tracking, so its .nfo/poster "
+                    "(if any) were left untouched - check them manually if needed."
+                )
+
+            # Sidecars this apply actually produced get an extra check: if
+            # one changed since apply left it, skip touching that specific
+            # sidecar (but still proceed with the rest of undo) rather than
+            # delete or overwrite something that isn't what MetaMatch wrote.
+            if nfo_current and _fingerprint_changed(nfo_current, after_state.get("nfo_size"), after_state.get("nfo_mtime_ns")):
+                result["warnings"].append(
+                    f"Skipped restoring '{os.path.basename(nfo_current)}' - it has changed since apply."
+                )
+                nfo_current = None
+            if poster_current and _fingerprint_changed(poster_current, after_state.get("poster_size"), after_state.get("poster_mtime_ns")):
+                result["warnings"].append(
+                    f"Skipped restoring '{os.path.basename(poster_current)}' - it has changed since apply."
+                )
+                poster_current = None
 
             path_to_use = current_path
             if current_path != original_path and os.path.exists(current_path):
@@ -674,8 +751,8 @@ class MovieLibrary:
             # original bytes restored if we snapshotted them; if it was
             # too large to snapshot or couldn't be read, it's left alone
             # rather than guessed at. A None path here (do_nfo/do_poster
-            # was False, so this transaction never touched that sidecar
-            # at all) is skipped entirely - nothing to undo.
+            # was False, a fingerprint mismatch above, or a legacy
+            # transaction with no known sidecar path) is skipped entirely.
             nfo_bytes = _unb64_or_none(snapshot.get("nfo_bytes_b64"))
             poster_bytes = _unb64_or_none(snapshot.get("poster_bytes_b64"))
 

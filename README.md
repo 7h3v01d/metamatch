@@ -182,6 +182,16 @@ one piece, without pulling in the stateful library classes at all — see
   touching it, and refuse (with a clear error) if something replaced or
   modified the file at that path in the meantime — e.g. another program
   writing to it, or a very stale scan. Rescan to clear the error.
+  `undo()` carries the same protection forward: it records a fingerprint
+  of exactly what `apply()` produced, and refuses to touch a file whose
+  fingerprint no longer matches when you later undo it. For movies, a
+  changed `.nfo`/poster specifically is skipped (with a warning) rather
+  than blocking the whole undo, since the video itself is usually still
+  fine to revert; a changed video file blocks the whole undo, same as
+  music. A transaction from before this check existed has no fingerprint
+  to verify against, so it's let through rather than becoming permanently
+  un-undoable — the same reasoning applies to older movie transactions
+  and their sidecar paths (see below).
 - **Browse…** is a small in-app folder picker, not your OS's native file
   dialog — browsers deliberately don't expose real filesystem paths from
   `<input type="file">` (even with a folder picked, JS only sees relative
@@ -359,7 +369,12 @@ they're organized are different:
   Sidecar paths after a rename-time naming collision (an unrelated file
   already sitting at the name a match would naturally produce) are
   tracked exactly, not reconstructed by guessing from the final filename
-  — a guess can land on someone else's file. Embedded-tag reverts are
+  — a guess can land on someone else's file. A transaction from before
+  this exact tracking existed has no way to recover where its sidecar
+  really went, so undo fails closed for it: the video's filename/tags
+  still get restored, but its `.nfo`/poster (if any) are left alone with
+  a warning, rather than risk guessing wrong and deleting something
+  unrelated. Embedded-tag reverts are
   reliable for `.mp4`/`.m4v` (direct atom edit); for
   `.mkv`/`.avi`/`.mov`/`.wmv` the embed goes through an `ffmpeg` remux
   that isn't cheaply reversible, so those tags are left as-is on undo -
@@ -372,7 +387,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-279 tests covering both the music and movie sides: filename/tag parsing,
+287 tests covering both the music and movie sides: filename/tag parsing,
 match-scoring math, tag writing and cover-art/poster embedding, renaming,
 undo (including the "don't delete a sidecar that already existed"
 edge case), duplicate detection and quarantine, TMDB key storage, the
