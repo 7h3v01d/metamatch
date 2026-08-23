@@ -44,6 +44,7 @@ from . import movie_matcher as movie_matcher_module
 from . import movie_tagger as movie_tagger_module
 from . import config as config_module
 from . import journal as journal_module
+from . import fingerprint as fingerprint_module
 
 # Cap on how large a pre-existing sidecar we'll snapshot in memory (and in
 # the journal) for undo purposes. .nfo files are small XML/text and always
@@ -93,30 +94,49 @@ def _read_small_file(path: str, max_bytes: int) -> Optional[bytes]:
         return None
 
 
-def _fingerprint_changed(path: str, expected_size: Optional[int], expected_mtime_ns: Optional[int]) -> bool:
-    """True if the file at path no longer matches the size/mtime recorded
-    at scan time - i.e. something replaced or modified it since MetaMatch
-    last looked. Applying a match found for the old content to whatever
-    is there now would silently mislabel an unrelated file, so callers
-    should refuse to proceed rather than guess."""
+def _fingerprint_changed(path: str, expected_size: Optional[int], expected_mtime_ns: Optional[int],
+                          expected_hash: Optional[str] = None) -> bool:
+    """True if the file at path no longer matches what was recorded
+    earlier - i.e. something replaced or modified it since MetaMatch last
+    looked. Applying a match found for the old content to whatever is
+    there now would silently mislabel an unrelated file, so callers
+    should refuse to proceed rather than guess.
+
+    Checks size/mtime first (cheap, catches ordinary replacement), then
+    the content hash if one was recorded (catches same-size content swaps
+    that also happen to preserve mtime - a real bypass of size+mtime
+    alone, found by adversarial review). expected_hash is optional so
+    fingerprints recorded before content hashing existed still degrade
+    gracefully to the size+mtime check rather than failing outright.
+    """
     if expected_size is None or expected_mtime_ns is None:
         return False  # no fingerprint recorded (e.g. constructed directly in a test) - nothing to check
     try:
         current = os.stat(path)
     except OSError:
         return True  # file's gone entirely - definitely changed
-    return current.st_size != expected_size or current.st_mtime_ns != expected_mtime_ns
+    if current.st_size != expected_size or current.st_mtime_ns != expected_mtime_ns:
+        return True
+    if expected_hash is not None:
+        current_hash = fingerprint_module.content_fingerprint(path)
+        if current_hash != expected_hash:
+            return True
+    return False
 
 
 def _file_fingerprint(path: Optional[str]) -> Optional[dict]:
-    """(size, mtime_ns) for a file that exists, or None - used to record
-    what a successful apply actually produced, so a later undo can verify
-    nothing replaced it in the meantime before touching it."""
+    """(size, mtime_ns, hash) for a file that exists, or None - used to
+    record what a successful apply actually produced, so a later undo can
+    verify nothing replaced it in the meantime before touching it."""
     if not path:
         return None
     try:
         st = os.stat(path)
-        return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+        return {
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+            "hash": fingerprint_module.content_fingerprint(path),
+        }
     except OSError:
         return None
 
@@ -257,7 +277,7 @@ class MusicLibrary:
         }
 
     def _apply_one(self, track: scanner_module.TrackFile, do_tag: bool, do_rename: bool, do_art: bool) -> dict:
-        if _fingerprint_changed(track.path, track.size_bytes, track.mtime_ns):
+        if _fingerprint_changed(track.path, track.size_bytes, track.mtime_ns, track.content_hash):
             return {
                 "original_path": track.path, "new_path": track.path,
                 "tagged": False, "renamed": False, "art_embedded": False,
@@ -297,7 +317,10 @@ class MusicLibrary:
             after_state = None
             media_fp = _file_fingerprint(result["new_path"])
             if media_fp:
-                after_state = {"media_size": media_fp["size"], "media_mtime_ns": media_fp["mtime_ns"]}
+                after_state = {
+                    "media_size": media_fp["size"], "media_mtime_ns": media_fp["mtime_ns"],
+                    "media_hash": media_fp["hash"],
+                }
             self.journal.commit(txn_id, result["new_path"], after_state=after_state)
             if existing:
                 self.journal.mark_superseded(existing.id)
@@ -335,7 +358,7 @@ class MusicLibrary:
         after_state = txn.after_state or {}
         expected_size = after_state.get("media_size")
         expected_mtime_ns = after_state.get("media_mtime_ns")
-        if _fingerprint_changed(current_path, expected_size, expected_mtime_ns):
+        if _fingerprint_changed(current_path, expected_size, expected_mtime_ns, after_state.get("media_hash")):
             result["error"] = (
                 "This file has changed since MetaMatch applied this match "
                 "(size/modification time no longer match) - undo refused to "
@@ -386,7 +409,7 @@ class MusicLibrary:
         with self._lock:
             folder = self.folder
             valid_paths = [p for p in paths if p in self.tracks]
-            fingerprints = {p: (self.tracks[p].size_bytes, self.tracks[p].mtime_ns) for p in valid_paths}
+            fingerprints = {p: (self.tracks[p].size_bytes, self.tracks[p].mtime_ns, self.tracks[p].content_hash) for p in valid_paths}
 
         if not folder:
             raise ValueError("Scan a folder first.")
@@ -403,8 +426,8 @@ class MusicLibrary:
         # happens to now sit at a previously-scanned path.
         still_valid = []
         for p in valid_paths:
-            size, mtime_ns = fingerprints[p]
-            if _fingerprint_changed(p, size, mtime_ns):
+            size, mtime_ns, content_hash = fingerprints[p]
+            if _fingerprint_changed(p, size, mtime_ns, content_hash):
                 results.append({
                     "original_path": p, "new_path": None,
                     "error": "File changed on disk since it was scanned - rescan before quarantining.",
@@ -593,7 +616,7 @@ class MovieLibrary:
 
     def _apply_one(self, video: video_scanner_module.VideoFile, do_tag: bool, do_rename: bool,
                     do_nfo: bool, do_poster: bool) -> dict:
-        if _fingerprint_changed(video.path, video.size_bytes, video.mtime_ns):
+        if _fingerprint_changed(video.path, video.size_bytes, video.mtime_ns, video.content_hash):
             return {
                 "original_path": video.path, "new_path": video.path,
                 "tagged": False, "renamed": False, "nfo_path": None, "poster_path": None,
@@ -631,14 +654,17 @@ class MovieLibrary:
             if media_fp:
                 after_state["media_size"] = media_fp["size"]
                 after_state["media_mtime_ns"] = media_fp["mtime_ns"]
+                after_state["media_hash"] = media_fp["hash"]
             nfo_fp = _file_fingerprint(result.get("nfo_path"))
             if nfo_fp:
                 after_state["nfo_size"] = nfo_fp["size"]
                 after_state["nfo_mtime_ns"] = nfo_fp["mtime_ns"]
+                after_state["nfo_hash"] = nfo_fp["hash"]
             poster_fp = _file_fingerprint(result.get("poster_path"))
             if poster_fp:
                 after_state["poster_size"] = poster_fp["size"]
                 after_state["poster_mtime_ns"] = poster_fp["mtime_ns"]
+                after_state["poster_hash"] = poster_fp["hash"]
 
             self.journal.commit(txn_id, result["new_path"], after_state=after_state)
             if existing:
@@ -681,7 +707,7 @@ class MovieLibrary:
         # applied to undo. No fingerprint recorded (a transaction from
         # before this check existed) means nothing to verify against, so
         # it's allowed through rather than blocking all older undo history.
-        if _fingerprint_changed(current_path, after_state.get("media_size"), after_state.get("media_mtime_ns")):
+        if _fingerprint_changed(current_path, after_state.get("media_size"), after_state.get("media_mtime_ns"), after_state.get("media_hash")):
             result["error"] = (
                 "This file has changed since MetaMatch applied this match "
                 "(size/modification time no longer match) - undo refused to "
@@ -719,12 +745,12 @@ class MovieLibrary:
             # one changed since apply left it, skip touching that specific
             # sidecar (but still proceed with the rest of undo) rather than
             # delete or overwrite something that isn't what MetaMatch wrote.
-            if nfo_current and _fingerprint_changed(nfo_current, after_state.get("nfo_size"), after_state.get("nfo_mtime_ns")):
+            if nfo_current and _fingerprint_changed(nfo_current, after_state.get("nfo_size"), after_state.get("nfo_mtime_ns"), after_state.get("nfo_hash")):
                 result["warnings"].append(
                     f"Skipped restoring '{os.path.basename(nfo_current)}' - it has changed since apply."
                 )
                 nfo_current = None
-            if poster_current and _fingerprint_changed(poster_current, after_state.get("poster_size"), after_state.get("poster_mtime_ns")):
+            if poster_current and _fingerprint_changed(poster_current, after_state.get("poster_size"), after_state.get("poster_mtime_ns"), after_state.get("poster_hash")):
                 result["warnings"].append(
                     f"Skipped restoring '{os.path.basename(poster_current)}' - it has changed since apply."
                 )
@@ -827,7 +853,7 @@ class MovieLibrary:
         with self._lock:
             folder = self.folder
             valid_paths = [p for p in paths if p in self.videos]
-            fingerprints = {p: (self.videos[p].size_bytes, self.videos[p].mtime_ns) for p in valid_paths}
+            fingerprints = {p: (self.videos[p].size_bytes, self.videos[p].mtime_ns, self.videos[p].content_hash) for p in valid_paths}
 
         if not folder:
             raise ValueError("Scan a folder first.")
@@ -842,8 +868,8 @@ class MovieLibrary:
         # whatever now happens to sit at that path.
         still_valid = []
         for p in valid_paths:
-            size, mtime_ns = fingerprints[p]
-            if _fingerprint_changed(p, size, mtime_ns):
+            size, mtime_ns, content_hash = fingerprints[p]
+            if _fingerprint_changed(p, size, mtime_ns, content_hash):
                 results.append({
                     "original_path": p, "new_path": None,
                     "error": "File changed on disk since it was scanned - rescan before quarantining.",

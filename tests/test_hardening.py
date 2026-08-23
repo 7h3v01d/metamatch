@@ -732,6 +732,123 @@ class TestToctouFingerprintCheck:
 
 
 @requires_ffmpeg
+class TestContentHashDefeatsAdversarialSameSizeSwap:
+    """size+mtime alone can be defeated: replace a file's content with
+    something else of the exact same byte count, then restore the
+    original modification time (os.utime lets any process do this
+    trivially, no special privileges needed) - a size+mtime-only check
+    sees no difference. A content hash sampled from the actual bytes
+    catches this even when size and mtime both lie. This is the
+    integration-level version of test_fingerprint.py's unit tests,
+    exercised against the real apply()/undo()/quarantine() call sites -
+    added after discovering the hash was computed at scan time but never
+    actually wired into any of the comparison call sites, so the
+    protection looked present in the code but wasn't reachable."""
+
+    def _swap_content_preserve_size_and_mtime(self, path: str, replacement_byte: bytes = b"X") -> None:
+        st = os.stat(path)
+        size, mtime_ns = st.st_size, st.st_mtime_ns
+        with open(path, "wb") as f:
+            f.write(replacement_byte * size)
+        os.utime(path, ns=(mtime_ns, mtime_ns))
+
+    def test_music_apply_refuses_same_size_content_swap(self, music_dir, mock_music_match):
+        from metamatch import MusicLibrary
+
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        lib.match()
+        target = lib.order[0]
+
+        self._swap_content_preserve_size_and_mtime(target)
+        result = lib.apply(target, do_tag=True, do_rename=False)
+        assert result["error"] is not None
+        assert result["tagged"] is False
+
+    def test_music_undo_refuses_same_size_content_swap(self, music_dir, mock_music_match):
+        from metamatch import MusicLibrary
+
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        lib.match()
+        result = lib.apply(lib.order[0], do_tag=True, do_rename=False)
+        assert result["error"] is None
+
+        self._swap_content_preserve_size_and_mtime(result["new_path"])
+        undo_result = lib.undo(result["new_path"])
+        assert undo_result["error"] is not None
+
+    def test_music_quarantine_refuses_same_size_content_swap(self, music_dir):
+        from metamatch import MusicLibrary
+
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        target = lib.order[0]
+
+        self._swap_content_preserve_size_and_mtime(target)
+        result = lib.quarantine([target])
+        assert result["moved"] == 0
+        assert result["results"][0]["error"] is not None
+
+    def test_movie_apply_refuses_same_size_content_swap(self, movie_dir, mock_movie_match, isolated_config):
+        isolated_config.set_tmdb_api_key("test-key")
+        from metamatch import MovieLibrary
+
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = [v for v in lib.videos_payload() if v["filename"] == "sample_movie.mp4"][0]["id"]
+
+        self._swap_content_preserve_size_and_mtime(target)
+        result = lib.apply(target, do_tag=False, do_rename=True, do_nfo=False, do_poster=False)
+        assert result["error"] is not None
+        assert result["renamed"] is False
+
+    def test_movie_undo_refuses_same_size_video_swap(self, movie_dir, mock_movie_match, isolated_config):
+        isolated_config.set_tmdb_api_key("test-key")
+        from metamatch import MovieLibrary
+
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = [v for v in lib.videos_payload() if v["filename"] == "sample_movie.mp4"][0]
+        result = lib.apply(target["id"], do_tag=False, do_rename=False, do_nfo=False, do_poster=False)
+        assert result["error"] is None
+
+        self._swap_content_preserve_size_and_mtime(result["new_path"])
+        undo_result = lib.undo(result["new_path"])
+        assert undo_result["error"] is not None
+
+    def test_movie_undo_skips_same_size_nfo_swap(self, movie_dir, mock_movie_match, isolated_config):
+        isolated_config.set_tmdb_api_key("test-key")
+        from metamatch import MovieLibrary
+
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = [v for v in lib.videos_payload() if v["filename"] == "sample_movie.mp4"][0]
+        result = lib.apply(target["id"], do_tag=False, do_rename=False, do_nfo=True, do_poster=False)
+        assert result["error"] is None
+
+        self._swap_content_preserve_size_and_mtime(result["nfo_path"], replacement_byte=b"Y")
+        undo_result = lib.undo(result["new_path"])
+        assert undo_result["error"] is None  # video still reverts fine
+        assert any("nfo" in w.lower() for w in undo_result["warnings"])
+
+    def test_movie_quarantine_refuses_same_size_content_swap(self, movie_dir):
+        from metamatch import MovieLibrary
+
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        target = [v for v in lib.videos_payload() if v["filename"] == "sample_movie.mp4"][0]["id"]
+
+        self._swap_content_preserve_size_and_mtime(target)
+        result = lib.quarantine([target])
+        assert result["moved"] == 0
+        assert result["results"][0]["error"] is not None
+
+
+@requires_ffmpeg
 class TestPersistentUndoAcrossRestarts:
     """The whole point of the journal: undo history and successful undo
     both survive a full process restart, not just an in-memory session."""

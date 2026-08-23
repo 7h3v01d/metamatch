@@ -22,6 +22,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .fingerprint import content_fingerprint
+
 SUPPORTED_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v"}
 
 FFPROBE_AVAILABLE = shutil.which("ffprobe") is not None
@@ -51,6 +53,7 @@ class VideoFile:
     size_bytes: int
     duration_seconds: Optional[float] = None
     mtime_ns: Optional[int] = None
+    content_hash: Optional[str] = None
 
     tag_title: Optional[str] = None
     tag_year: Optional[str] = None
@@ -130,6 +133,9 @@ def read_video(path: str) -> VideoFile:
     stat_result = os.stat(path)
     size_bytes = stat_result.st_size
     mtime_ns = stat_result.st_mtime_ns
+    # Sampled (not full) hash for video - see fingerprint.py. A multi-
+    # gigabyte movie only gets three bounded 1 MiB reads, not a full read.
+    content_hash = content_fingerprint(path)
 
     fmt = _ffprobe(path)
     duration = None
@@ -151,7 +157,7 @@ def read_video(path: str) -> VideoFile:
 
     return VideoFile(
         path=path, filename=filename, ext=ext, size_bytes=size_bytes,
-        duration_seconds=duration, mtime_ns=mtime_ns,
+        duration_seconds=duration, mtime_ns=mtime_ns, content_hash=content_hash,
         tag_title=tag_title, tag_year=tag_year,
         guess_title=guess_title, guess_year=guess_year,
     )

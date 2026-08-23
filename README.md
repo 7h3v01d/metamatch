@@ -177,11 +177,23 @@ one piece, without pulling in the stateful library classes at all — see
   blend of fuzzy text, duration/year, and (for movies) TMDB search
   relevance ordering — it does not factor in a movie's popularity/rating,
   since that's evidence of nothing about *which* movie a file actually is.
-- `apply()` and `quarantine()` both re-check a file's size and
-  modification time against what was recorded at scan time before
+- `apply()` and `quarantine()` both re-check a file's size, modification
+  time, *and* content against what was recorded at scan time before
   touching it, and refuse (with a clear error) if something replaced or
   modified the file at that path in the meantime — e.g. another program
-  writing to it, or a very stale scan. Rescan to clear the error.
+  writing to it, or a very stale scan. The content check exists because
+  size+mtime alone can be beaten: overwrite a file with different bytes
+  of the exact same length, then reset its modification time with
+  `os.utime` (any process can do this, no special access needed), and a
+  size/mtime-only check sees nothing wrong. The content signature is a
+  SHA-256 of the whole file for anything under ~3MB, or three 1MB samples
+  (start/middle/end) for anything larger, so checking a multi-gigabyte
+  movie stays fast and bounded rather than hashing the whole thing on
+  every apply. It's a strong deterrent, not a cryptographic guarantee —
+  an adversary who knew exactly which byte ranges are sampled and crafted
+  a file to match all three could still slip past it — but it closes the
+  bypass that just needed `os.utime` and nothing else. Rescan to clear
+  the error.
   `undo()` carries the same protection forward: it records a fingerprint
   of exactly what `apply()` produced, and refuses to touch a file whose
   fingerprint no longer matches when you later undo it. For movies, a
@@ -291,6 +303,7 @@ metamatch/                (repo root)
     __init__.py                 Public API: MusicLibrary, MovieLibrary
     library.py                    MusicLibrary/MovieLibrary - the stateful orchestration layer
     journal.py                      Persistent write-ahead undo/crash-recovery log (SQLite)
+    fingerprint.py                    Content-hash file identity (defeats size+mtime-only staleness checks)
     scanner.py                      Music: folder walking, tag reading, filename parsing
     matcher.py                        Music: MusicBrainz search + confidence scoring
     tagger.py                           Music: tag writing, cover art embedding, renaming
@@ -387,7 +400,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-287 tests covering both the music and movie sides: filename/tag parsing,
+304 tests covering both the music and movie sides: filename/tag parsing,
 match-scoring math, tag writing and cover-art/poster embedding, renaming,
 undo (including the "don't delete a sidecar that already existed"
 edge case), duplicate detection and quarantine, TMDB key storage, the
@@ -424,6 +437,7 @@ tests/
   test_movie_tagger.py         Rename, .nfo, poster, embedded metadata
   test_config.py                 TMDB key storage
   test_journal.py                  Persistent write-ahead journal, in isolation
+  test_fingerprint.py                Content-hash file identity, in isolation
   test_library.py                    MusicLibrary/MovieLibrary used directly, no Flask
   test_app_music.py                  Music Flask routes, end to end
   test_app_movies.py                   Movie Flask routes, end to end

@@ -17,6 +17,8 @@ from mutagen.id3 import ID3
 from mutagen.easyid3 import EasyID3
 from mutagen.asf import ASF
 
+from .fingerprint import content_fingerprint
+
 SUPPORTED_EXTENSIONS = {".mp3", ".wma", ".flac", ".m4a", ".ogg", ".wav"}
 
 # Common "junk" tokens that show up in ripped/downloaded filenames and hurt
@@ -41,6 +43,7 @@ class TrackFile:
     size_bytes: int
     duration_seconds: Optional[float] = None
     mtime_ns: Optional[int] = None
+    content_hash: Optional[str] = None
 
     tag_artist: Optional[str] = None
     tag_title: Optional[str] = None
@@ -185,6 +188,12 @@ def read_track(path: str) -> TrackFile:
     stat_result = os.stat(path)
     size_bytes = stat_result.st_size
     mtime_ns = stat_result.st_mtime_ns
+    # Bounded-cost hash (whole file if small, sampled if large - see
+    # fingerprint.py) so a later apply/quarantine/undo can detect a file
+    # whose content changed even if its size and modification time were
+    # both preserved (e.g. a restore tool that keeps mtimes, or tampering
+    # that specifically avoids touching either).
+    content_hash = content_fingerprint(path)
 
     duration = None
     try:
@@ -212,6 +221,7 @@ def read_track(path: str) -> TrackFile:
         size_bytes=size_bytes,
         duration_seconds=duration,
         mtime_ns=mtime_ns,
+        content_hash=content_hash,
         tag_artist=tags.get("artist"),
         tag_title=tags.get("title"),
         tag_album=tags.get("album"),
