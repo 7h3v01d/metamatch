@@ -801,16 +801,34 @@ async function checkRecoveryNotices() {
   try {
     const resp = await fetch("/api/recovery");
     const data = await resp.json();
-    const all = [...(data.music || []), ...(data.movies || [])];
-    if (all.length === 0) return;
 
     const banner = el("recoveryBanner");
     const title = el("recoveryBannerTitle");
     const detail = el("recoveryBannerDetail");
 
-    title.textContent = `${all.length} operation${all.length === 1 ? "" : "s"} may have been interrupted by a crash or restart`;
-    const fileList = all.slice(0, 5).map(n => n.original_path.split("/").pop()).join(", ");
-    const more = all.length > 5 ? ` and ${all.length - 5} more` : "";
+    const attention = data.needs_attention || [];
+    const startup = [...(data.music || []), ...(data.movies || [])];
+
+    if (attention.length > 0) {
+      // Files that may be left inconsistent and couldn't be auto-restored -
+      // the serious case. Persists across restarts until resolved.
+      banner.classList.add("attention");
+      title.textContent = `${attention.length} file${attention.length === 1 ? "" : "s"} may need a manual check after an interrupted operation`;
+      const names = attention.slice(0, 5).map(n => (n.original_path || n.current_path || "").split("/").pop()).filter(Boolean).join(", ");
+      const more = attention.length > 5 ? ` and ${attention.length - 5} more` : "";
+      detail.textContent = `MetaMatch couldn't fully undo a failed change to: ${names}${more}. Check each file's tags, filename, and any .nfo/poster sidecars by hand.`;
+      banner.hidden = false;
+      return;
+    }
+
+    if (startup.length === 0) return;
+
+    // Milder case: something was interrupted, but nothing was necessarily
+    // left half-changed.
+    banner.classList.remove("attention");
+    title.textContent = `${startup.length} operation${startup.length === 1 ? "" : "s"} may have been interrupted by a crash or restart`;
+    const fileList = startup.slice(0, 5).map(n => (n.original_path || "").split("/").pop()).filter(Boolean).join(", ");
+    const more = startup.length > 5 ? ` and ${startup.length - 5} more` : "";
     detail.textContent = `MetaMatch was closed mid-operation on: ${fileList}${more}. Worth checking these files' tags/filenames by hand — their last apply may or may not have finished.`;
     banner.hidden = false;
   } catch (e) {

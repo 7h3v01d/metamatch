@@ -198,6 +198,114 @@ def embed_cover_art(path: str, image_bytes: bytes, mime: str) -> None:
         raise ValueError(f"Cover art embedding isn't supported for {ext} files.")
 
 
+_MP4_FORMAT_TO_MIME = {
+    MP4Cover.FORMAT_JPEG: "image/jpeg",
+    MP4Cover.FORMAT_PNG: "image/png",
+}
+
+
+def read_cover_art(path: str) -> "tuple[bytes, str] | None":
+    """Returns (image_bytes, mime) for the file's current front-cover art,
+    or None if it has none / the format isn't one we embed into. Used to
+    snapshot art *before* an apply embeds new art, so a failed apply's
+    rollback can put the original back (or clear it, if there was none)."""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext in (".mp3", ".wav"):
+            tags = (ID3(path) if ext == ".mp3" else WAVE(path).tags)
+            if tags is None:
+                return None
+            apics = tags.getall("APIC")
+            if apics:
+                return apics[0].data, (apics[0].mime or "image/jpeg")
+        elif ext == ".flac":
+            pics = FLAC(path).pictures
+            if pics:
+                return pics[0].data, (pics[0].mime or "image/jpeg")
+        elif ext == ".m4a":
+            covers = MP4(path).get("covr")
+            if covers:
+                cover = covers[0]
+                fmt = getattr(cover, "imageformat", MP4Cover.FORMAT_JPEG)
+                return bytes(cover), _MP4_FORMAT_TO_MIME.get(fmt, "image/jpeg")
+        elif ext == ".ogg":
+            encoded = OggVorbis(path).get("metadata_block_picture")
+            if encoded:
+                pic = Picture(base64.b64decode(encoded[0]))
+                return pic.data, (pic.mime or "image/jpeg")
+        elif ext == ".wma":
+            values = ASF(path).get("WM/Picture")
+            if values:
+                return _parse_wma_picture_bytes(bytes(values[0].value))
+    except Exception:
+        # Reading existing art is best-effort: if anything about the
+        # container is unexpected (unreadable, unusual tag layout, a
+        # mutagen quirk), report "no snapshot" rather than raise - the
+        # caller degrades to a warning instead of a false restore.
+        return None
+    return None
+
+
+def _parse_wma_picture_bytes(payload: bytes) -> "tuple[bytes, str] | None":
+    """Inverse of _build_wma_picture_bytes: 1 byte type, 4 byte LE size,
+    null-terminated UTF-16LE mime + description, then the image bytes."""
+    if len(payload) < 5:
+        return None
+    offset = 1 + 4  # skip picture type + declared size
+    end_mime = payload.find(b"\x00\x00", offset)
+    if end_mime == -1:
+        return None
+    mime = payload[offset:end_mime].decode("utf-16-le", errors="replace")
+    offset = end_mime + 2
+    end_desc = payload.find(b"\x00\x00", offset)
+    if end_desc == -1:
+        return None
+    image = payload[end_desc + 2:]
+    return image, (mime or "image/jpeg")
+
+
+def remove_cover_art(path: str) -> None:
+    """Strips embedded front-cover art. Used on rollback when a failed
+    apply embedded art into a file that had none before, to return it to
+    that art-free before-state. Dispatches by extension like embed."""
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext in (".mp3", ".wav"):
+        if ext == ".mp3":
+            try:
+                tags = ID3(path)
+            except ID3NoHeaderError:
+                return
+            tags.delall("APIC")
+            tags.save(path)
+        else:
+            audio = WAVE(path)
+            if audio.tags is not None:
+                audio.tags.delall("APIC")
+                audio.save()
+    elif ext == ".wma":
+        audio = ASF(path)
+        if "WM/Picture" in audio:
+            del audio["WM/Picture"]
+            audio.save()
+    elif ext == ".flac":
+        audio = FLAC(path)
+        audio.clear_pictures()
+        audio.save()
+    elif ext == ".m4a":
+        audio = MP4(path)
+        if "covr" in audio:
+            del audio["covr"]
+            audio.save()
+    elif ext == ".ogg":
+        audio = OggVorbis(path)
+        if "metadata_block_picture" in audio:
+            del audio["metadata_block_picture"]
+            audio.save()
+    else:
+        raise ValueError(f"Cover art removal isn't supported for {ext} files.")
+
+
 def rename_to_match(path: str, match: dict) -> str:
     """Renames the file to 'Artist - Title.ext', avoiding collisions. Returns the new path."""
     folder = os.path.dirname(path)

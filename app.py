@@ -54,7 +54,7 @@ from metamatch import MusicLibrary, MovieLibrary
 from metamatch.art import fetch_cover_art
 from metamatch.movie_matcher import TmdbNotConfigured
 from metamatch import config as app_config
-from metamatch.journal import Journal
+from metamatch.journal import Journal, RECOVERY_REQUIRED, INTERRUPTED
 
 app = Flask(__name__)
 
@@ -158,15 +158,63 @@ def api_browse():
     })
 
 
+def _recovery_severity(status: str) -> str:
+    """RECOVERY_REQUIRED means a file may be left inconsistent and wants a
+    human; everything else recovery surfaces (a benign INTERRUPTED pending
+    row) is informational."""
+    return "attention" if status == RECOVERY_REQUIRED else "info"
+
+
+def _recovery_message(notice: dict) -> str:
+    name = os.path.basename(notice.get("original_path") or notice.get("current_path") or "a file")
+    if notice.get("status") == RECOVERY_REQUIRED:
+        info = notice.get("rollback_info") or {}
+        note = info.get("note")
+        base = (f"{name} may have been left partially changed and couldn't be automatically "
+                f"restored — check its tags, filename, and any .nfo/poster sidecars by hand.")
+        return f"{base} ({note})" if note else base
+    return (f"MetaMatch was closed before it finished working on {name}. Nothing was necessarily "
+            f"changed, but its last operation didn't complete — a quick check doesn't hurt.")
+
+
+def _enrich_notices(notices: list[dict]) -> list[dict]:
+    out = []
+    for n in notices:
+        out.append({**n, "severity": _recovery_severity(n.get("status")),
+                    "message": _recovery_message(n)})
+    return out
+
+
 @app.route("/api/recovery")
 def api_recovery():
-    """Transactions left mid-flight by a crash/kill before this process
-    started - each names a file whose last apply/undo may not have
-    finished. Checked once, at startup (see MusicLibrary/MovieLibrary's
-    constructor), not on every request."""
+    """Operations that may not have finished cleanly. Two layers:
+
+      * `music`/`movies`: what THIS process's startup recovery found (benign
+        interrupted rows plus anything escalated), each tagged with a
+        severity and a plain-language message.
+      * `needs_attention`: every transaction still sitting at
+        RECOVERY_REQUIRED in the journal, regardless of which boot flagged
+        it - so a file that genuinely needs a human keeps being surfaced on
+        every restart until it's resolved, instead of scrolling past once.
+    """
+    music_notices = _enrich_notices(music_library.get_recovery_notices())
+    movie_notices = _enrich_notices(movie_library.get_recovery_notices())
+
+    attention = (
+        [{**n, "kind": "music"} for n in music_library.get_outstanding_recovery()] +
+        [{**n, "kind": "movie"} for n in movie_library.get_outstanding_recovery()]
+    )
+    interrupted = sum(1 for n in (music_notices + movie_notices) if n["severity"] == "info")
+
     return jsonify({
-        "music": music_library.get_recovery_notices(),
-        "movies": movie_library.get_recovery_notices(),
+        "music": music_notices,
+        "movies": movie_notices,
+        "needs_attention": attention,
+        "summary": {
+            "interrupted": interrupted,
+            "recovery_required": len(attention),
+            "needs_attention": len(attention) > 0,
+        },
     })
 
 

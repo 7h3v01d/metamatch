@@ -149,6 +149,137 @@ def _unb64_or_none(data: Optional[str]) -> Optional[bytes]:
     return base64.b64decode(data) if data is not None else None
 
 
+# --------------------------------------------------------------------------
+# Automatic rollback
+#
+# apply() records a journal transaction and then performs a *sequence* of
+# individually-valid file mutations (music: tags -> art -> rename; movie:
+# embed -> nfo -> poster -> rename). If one of those raises partway, the
+# earlier successful mutations used to be left in place - the journal knew
+# something failed but the file was half-changed. These helpers compensate
+# that partial work, driving each failed transaction to one of two terminal
+# states: ROLLED_BACK (before-state restored) or RECOVERY_REQUIRED (a
+# compensation that was expected to work didn't, so a human must look).
+#
+# A key invariant makes this tractable: rename is the LAST mutation in both
+# taggers, so a failed apply never moved the file. Rollback is therefore
+# always in-place at the original path - no rename-back, no cross-file
+# clobber risk. The only genuinely irreversible mutations are the ones undo
+# already declines to touch (an ffmpeg remux, and re-embedding pre-existing
+# cover art we couldn't snapshot); those are surfaced as warnings rather
+# than treated as a structural failure.
+# --------------------------------------------------------------------------
+
+def _finalize_failed_apply(journal, txn_id: int, result: dict, restored_ok: bool, warnings: list) -> None:
+    """Records the outcome of a rollback on both the journal row and the
+    result dict the caller returns, so the app/tests can see what happened
+    without querying the journal."""
+    info = {"apply_error": result.get("error")}
+    if warnings:
+        info["warnings"] = warnings
+        result.setdefault("warnings", []).extend(warnings)
+    if restored_ok:
+        journal.mark_rolled_back(txn_id, info)
+        result["rolled_back"] = True
+    else:
+        journal.mark_recovery_required(txn_id, info)
+        result["recovery_required"] = True
+
+
+def _rollback_music_apply(path: str, pre_apply_tags: dict, pre_apply_art, result: dict) -> "tuple[bool, list]":
+    """Compensate a failed music apply, in place at `path` (rename is last,
+    so a failure means the file never moved). Returns (fully_restored,
+    warnings)."""
+    warnings: list = []
+    fully_restored = True
+
+    if result.get("tagged"):
+        try:
+            tagger_module.set_or_clear_tags(path, **pre_apply_tags)
+        except Exception as e:
+            fully_restored = False
+            warnings.append(f"Could not restore original tags on '{os.path.basename(path)}': {e}")
+
+    if result.get("art_embedded"):
+        try:
+            if pre_apply_art is None:
+                # No art before this apply (or it couldn't be snapshotted) -
+                # strip what we embedded to get back to an art-free state.
+                tagger_module.remove_cover_art(path)
+            else:
+                art_bytes, art_mime = pre_apply_art
+                tagger_module.embed_cover_art(path, art_bytes, art_mime)
+        except Exception as e:
+            # Embedded art is exactly what undo also declines to fully
+            # manage; a failure to revert it is cosmetic, not a structural
+            # inconsistency, so it warns rather than forcing recovery.
+            warnings.append(f"Could not revert embedded cover art on '{os.path.basename(path)}': {e}")
+
+    return fully_restored, warnings
+
+
+def _rollback_movie_apply(path: str, pre_apply: dict, result: dict) -> "tuple[bool, list]":
+    """Compensate a failed movie apply, in place at `path`. Reverts mp4/m4v
+    embedded atoms and created/overwritten .nfo/poster sidecars; an ffmpeg
+    remux (mkv/avi/mov/wmv) can't be reversed without the original bytes, so
+    it's surfaced as a warning. Returns (fully_restored, warnings)."""
+    warnings: list = []
+    fully_restored = True
+    ext = os.path.splitext(path)[1].lower()
+
+    if result.get("tagged"):
+        if ext in (".mp4", ".m4v"):
+            try:
+                from mutagen.mp4 import MP4
+                audio = MP4(path)
+                if pre_apply.get("tag_title"):
+                    audio["\xa9nam"] = [pre_apply["tag_title"]]
+                elif "\xa9nam" in audio:
+                    del audio["\xa9nam"]
+                if pre_apply.get("tag_year"):
+                    audio["\xa9day"] = [str(pre_apply["tag_year"])]
+                elif "\xa9day" in audio:
+                    del audio["\xa9day"]
+                audio.save()
+            except Exception as e:
+                fully_restored = False
+                warnings.append(f"Could not revert embedded metadata on '{os.path.basename(path)}': {e}")
+        else:
+            warnings.append(
+                "Embedded metadata was written via an ffmpeg remux, which can't be "
+                "automatically reverted - the video was left as remuxed."
+            )
+
+    for key, had_key, bytes_key, label in (
+        ("nfo_path", "had_nfo", "nfo_bytes_b64", ".nfo"),
+        ("poster_path", "had_poster", "poster_bytes_b64", "poster"),
+    ):
+        created = result.get(key)
+        if not created or not os.path.exists(created):
+            continue
+        try:
+            if not pre_apply.get(had_key):
+                # We created this sidecar fresh - remove it.
+                os.remove(created)
+            else:
+                # It existed before and we overwrote it - restore its bytes
+                # if we snapshotted them, else leave it and say so.
+                original = _unb64_or_none(pre_apply.get(bytes_key))
+                if original is not None:
+                    with open(created, "wb") as f:
+                        f.write(original)
+                else:
+                    warnings.append(
+                        f"Original {label} couldn't be snapshotted before apply; "
+                        "left as MetaMatch wrote it."
+                    )
+        except OSError as e:
+            fully_restored = False
+            warnings.append(f"Could not restore {label} '{os.path.basename(created)}': {e}")
+
+    return fully_restored, warnings
+
+
 class MusicLibrary:
     """One scanned folder of audio files, its MusicBrainz matches, and
     journal-backed undo history (see journal.py - undo persists across
@@ -175,7 +306,14 @@ class MusicLibrary:
         check, since the interrupted operation's outcome is unknown."""
         return [t.to_dict() for t in self.recovered_transactions]
 
-    # ---------------------------------------------------------------- scan
+    def get_outstanding_recovery(self) -> list[dict]:
+        """Every transaction still sitting at RECOVERY_REQUIRED in the
+        journal - a rollback that couldn't fully restore, or a crash caught
+        mid-apply. Unlike get_recovery_notices() (only this startup's
+        findings), these persist across restarts until resolved, so the UI
+        can keep flagging a file that genuinely needs a human until someone
+        deals with it."""
+        return [t.to_dict() for t in self.journal.list_by_status("music", journal_module.RECOVERY_REQUIRED)]
     def scan(self, folder: str, recursive: bool = True) -> list[dict]:
         """Scans a folder for audio files. Replaces any previously scanned session."""
         tracks = scanner_module.scan_folder(folder, recursive=recursive)
@@ -297,6 +435,14 @@ class MusicLibrary:
             true_original_path = track.path
             before_state = self._snapshot_original_tags(track)
 
+        # This apply's own rollback target is the file's state RIGHT NOW,
+        # not the chained true-original 'before_state' above. If this file
+        # was already applied once, rolling back a failed *second* apply
+        # must land on the committed first-apply state - which is what these
+        # capture - rather than reverting the whole lineage (undo's job).
+        pre_apply_tags = self._snapshot_original_tags(track)
+        pre_apply_art = tagger_module.read_cover_art(track.path) if do_art else None
+
         operation = {"do_tag": do_tag, "do_rename": do_rename, "do_art": do_art}
         txn_id = self.journal.begin("music", true_original_path, track.path, before_state, operation)
 
@@ -306,13 +452,21 @@ class MusicLibrary:
             if fetched:
                 art_bytes, art_mime = fetched
 
+        # Past this point files are actually mutated - mark 'applying' so a
+        # crash mid-mutation is recoverable as such (vs a benign 'pending').
+        self.journal.mark_applying(txn_id)
         result = tagger_module.apply_match(
             track.path, track.match, do_tag=do_tag, do_rename=do_rename,
             do_art=do_art, art_bytes=art_bytes, art_mime=art_mime,
         )
+        result["txn_id"] = txn_id
+        result["rolled_back"] = False
+        result["recovery_required"] = False
 
         if result["error"]:
-            self.journal.fail(txn_id, result["error"])
+            self.journal.mark_rolling_back(txn_id)
+            restored_ok, warnings = _rollback_music_apply(track.path, pre_apply_tags, pre_apply_art, result)
+            _finalize_failed_apply(self.journal, txn_id, result, restored_ok, warnings)
         else:
             after_state = None
             media_fp = _file_fingerprint(result["new_path"])
@@ -486,9 +640,15 @@ class MovieLibrary:
 
         self.journal = journal or journal_module.Journal(journal_module.DEFAULT_JOURNAL_PATH)
         self.recovered_transactions = self.journal.recover("movie")
+        self.swept_orphan_temps: list[str] = []
 
     def get_recovery_notices(self) -> list[dict]:
         return [t.to_dict() for t in self.recovered_transactions]
+
+    def get_outstanding_recovery(self) -> list[dict]:
+        """Movie transactions still at RECOVERY_REQUIRED - persists across
+        restarts until resolved (see MusicLibrary.get_outstanding_recovery)."""
+        return [t.to_dict() for t in self.journal.list_by_status("movie", journal_module.RECOVERY_REQUIRED)]
 
     @property
     def ffprobe_available(self) -> bool:
@@ -501,6 +661,10 @@ class MovieLibrary:
     # ---------------------------------------------------------------- scan
     def scan(self, folder: str, recursive: bool = True) -> list[dict]:
         videos = video_scanner_module.scan_folder(folder, recursive=recursive)
+        # Clean up any remux temp files a killed process orphaned here (age-
+        # guarded, so an in-progress remux is never disturbed). Best-effort:
+        # recorded for surfacing but never allowed to fail a scan.
+        self.swept_orphan_temps = movie_tagger_module.sweep_orphan_remux_temps(folder)
         with self._lock:
             self.folder = folder
             self.videos = {v.path: v for v in videos}
@@ -631,15 +795,26 @@ class MovieLibrary:
             true_original_path = video.path
             snapshot = self._snapshot_original(video)
 
+        # Immediate pre-apply state = this apply's rollback target (see the
+        # music path for why this is captured separately from 'snapshot',
+        # which is undo's whole-lineage target).
+        pre_apply = self._snapshot_original(video)
+
         operation = {"do_tag": do_tag, "do_rename": do_rename, "do_nfo": do_nfo, "do_poster": do_poster}
         txn_id = self.journal.begin("movie", true_original_path, video.path, snapshot, operation)
 
+        self.journal.mark_applying(txn_id)
         result = movie_tagger_module.apply_movie_match(
             video.path, video.match, do_tag=do_tag, do_rename=do_rename, do_nfo=do_nfo, do_poster=do_poster,
         )
+        result["txn_id"] = txn_id
+        result["rolled_back"] = False
+        result["recovery_required"] = False
 
         if result["error"]:
-            self.journal.fail(txn_id, result["error"])
+            self.journal.mark_rolling_back(txn_id)
+            restored_ok, warnings = _rollback_movie_apply(video.path, pre_apply, result)
+            _finalize_failed_apply(self.journal, txn_id, result, restored_ok, warnings)
         else:
             # Record the EXACT sidecar paths this apply actually produced,
             # not a path undo could reconstruct later - a rename-time name

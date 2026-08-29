@@ -168,6 +168,13 @@ main {
   padding: 16px 20px;
   margin-bottom: 4px;
 }
+/* The serious variant: a file that may be left inconsistent and couldn't be
+   auto-restored. Stronger fill + a left rule to set it apart from the milder
+   "something was interrupted" notice, which shares the base style above. */
+.recovery-banner.attention {
+  background: rgba(226, 87, 76, 0.16);
+  border-left: 4px solid var(--red);
+}
 /* An author-stylesheet display:flex rule on this class otherwise beats the
    browser's own [hidden] { display: none } default, since author styles
    take precedence over user-agent styles in the cascade regardless of

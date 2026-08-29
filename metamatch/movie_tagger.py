@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import xml.etree.ElementTree as ET
 
 import requests
@@ -142,13 +143,54 @@ def _probe_stream_summary(path: str) -> list[tuple]:
     return [(s.get("index"), s.get("codec_type"), s.get("codec_name")) for s in data.get("streams", [])]
 
 
+# Marker embedded in every remux temp file's name. On success the temp is
+# os.replace()d into place and on a handled failure it's removed - but if the
+# whole process is killed mid-remux, the cleanup can't run and the temp is
+# orphaned. sweep_orphan_remux_temps() finds these by this marker on the next
+# scan (see MovieLibrary.scan) so they don't accumulate.
+REMUX_TMP_MARKER = ".metamatch_tmp"
+
+
+def _remux_tmp_path(path: str) -> str:
+    folder, name = os.path.split(path)
+    base, ext = os.path.splitext(name)
+    return os.path.join(folder, f".{base}{REMUX_TMP_MARKER}{ext}")
+
+
+def sweep_orphan_remux_temps(folder: str, min_age_seconds: int = 300) -> list[str]:
+    """Remove remux temp files left behind by a process that was killed
+    mid-remux. Guarded by an age threshold: a temp younger than
+    min_age_seconds might be an in-progress remux writing right now (its
+    mtime keeps advancing as ffmpeg writes), so it's left alone. Only clearly
+    stale orphans are deleted. Returns the paths removed. Never raises - a
+    sweep failure must not stop a scan."""
+    removed: list[str] = []
+    try:
+        entries = os.listdir(folder)
+    except OSError:
+        return removed
+    now = time.time()
+    for entry in entries:
+        if REMUX_TMP_MARKER not in entry:
+            continue
+        candidate = os.path.join(folder, entry)
+        try:
+            if not os.path.isfile(candidate):
+                continue
+            if now - os.path.getmtime(candidate) < min_age_seconds:
+                continue  # possibly an active remux - don't touch it
+            os.remove(candidate)
+            removed.append(candidate)
+        except OSError:
+            continue  # gone already, or permission - skip, never fatal
+    return removed
+
+
 def _embed_via_ffmpeg_remux(path: str, match: dict) -> None:
     if not FFMPEG_AVAILABLE:
         raise RuntimeError("ffmpeg isn't installed/available on PATH, so metadata can't be embedded for this format.")
 
-    folder, name = os.path.split(path)
-    base, ext = os.path.splitext(name)
-    tmp_path = os.path.join(folder, f".{base}.metamatch_tmp{ext}")
+    tmp_path = _remux_tmp_path(path)
 
     metadata_args = []
     if match.get("title"):
