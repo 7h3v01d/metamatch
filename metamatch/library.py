@@ -49,6 +49,7 @@ from . import tv_tagger as tv_tagger_module
 from . import config as config_module
 from . import journal as journal_module
 from . import fingerprint as fingerprint_module
+from . import pathsafe as pathsafe_module
 
 # Cap on how large a pre-existing sidecar we'll snapshot in memory (and in
 # the journal) for undo purposes. .nfo files are small XML/text and always
@@ -93,6 +94,21 @@ class _PathLockRegistry:
                 lock = threading.RLock()
                 self._locks[key] = lock
             return lock
+
+
+def _authority_error(root: "str | None", path: str, *, allow_missing: bool = False) -> "str | None":
+    """Returns a refusal reason if `path` is not a safe mutation target under
+    the active library `root`, else None. Used by every destructive entry
+    point (Apply/Undo/Quarantine/series metadata) to re-check authority at
+    mutation time. If there's no active scan root (an undo issued before any
+    scan), it still fails closed on links/reparse points, which is the part
+    that doesn't need a root to judge."""
+    if root:
+        ok, reason = pathsafe_module.validate_mutation_target(path, root, allow_missing=allow_missing)
+        return None if ok else reason
+    if pathsafe_module.is_link_or_reparse(path):
+        return "it is a symlink or reparse point"
+    return None
 
 
 @contextlib.contextmanager
@@ -483,8 +499,10 @@ def _rollback_tv_apply(path: str, pre_apply: dict, result: dict) -> "tuple[bool,
                 if atom_snapshot is not None:
                     _restore_mp4_atoms(path, atom_snapshot)
                 else:
-                    # Older journal row without a full atom snapshot: fall back
-                    # to the title/year-only behaviour (best effort).
+                    # Legacy row without a full atom snapshot: restore title/
+                    # year only and leave TV-specific atoms untouched - never
+                    # delete atoms we can't prove we created (see the matching
+                    # fail-closed branch in the TV undo path).
                     from mutagen.mp4 import MP4
                     audio = MP4(path)
                     if pre_apply.get("tag_title"):
@@ -495,10 +513,10 @@ def _rollback_tv_apply(path: str, pre_apply: dict, result: dict) -> "tuple[bool,
                         audio["\xa9day"] = [str(pre_apply["tag_year"])]
                     elif "\xa9day" in audio:
                         del audio["\xa9day"]
-                    for atom in ("tvsh", "tvsn", "tves", "stik", "\xa9ART"):
-                        if atom in audio:
-                            del audio[atom]
                     audio.save()
+                    warnings.append(
+                        "Original show/season/episode atoms weren't recorded for this file, so "
+                        "they were left as-is rather than deleted during rollback.")
             except Exception as e:
                 fully_restored = False
                 warnings.append(f"Could not revert embedded metadata on '{os.path.basename(path)}': {e}")
@@ -677,6 +695,13 @@ class MusicLibrary:
         }
 
     def _apply_one(self, track: scanner_module.TrackFile, do_tag: bool, do_rename: bool, do_art: bool) -> dict:
+        safe, reason = pathsafe_module.validate_mutation_target(track.path, self.folder)
+        if not safe:
+            return {
+                "original_path": track.path, "new_path": track.path,
+                "tagged": False, "renamed": False, "art_embedded": False,
+                "error": f"Refused to modify '{os.path.basename(track.path)}': {reason}.",
+            }
         if _fingerprint_changed(track.path, track.size_bytes, track.mtime_ns, track.content_hash):
             return {
                 "original_path": track.path, "new_path": track.path,
@@ -786,6 +811,11 @@ class MusicLibrary:
         original_path = txn.original_path
         result = {"restored_path": current_path, "error": None}
 
+        auth = _authority_error(self.folder, current_path)
+        if auth:
+            result["error"] = f"Refused to undo '{os.path.basename(current_path)}': {auth}."
+            return result
+
         after_state = txn.after_state or {}
         expected_size = after_state.get("media_size")
         expected_mtime_ns = after_state.get("media_mtime_ns")
@@ -862,6 +892,13 @@ class MusicLibrary:
             # happens to now sit at a previously-scanned path.
             still_valid = []
             for p in valid_paths:
+                auth = _authority_error(folder, p)
+                if auth:
+                    results.append({
+                        "original_path": p, "new_path": None,
+                        "error": f"Refused to quarantine '{os.path.basename(p)}': {auth}.",
+                    })
+                    continue
                 size, mtime_ns, content_hash = fingerprints[p]
                 if _fingerprint_changed(p, size, mtime_ns, content_hash):
                     results.append({
@@ -1066,6 +1103,13 @@ class MovieLibrary:
 
     def _apply_one(self, video: video_scanner_module.VideoFile, do_tag: bool, do_rename: bool,
                     do_nfo: bool, do_poster: bool) -> dict:
+        safe, reason = pathsafe_module.validate_mutation_target(video.path, self.folder)
+        if not safe:
+            return {
+                "original_path": video.path, "new_path": video.path,
+                "tagged": False, "renamed": False, "nfo_path": None, "poster_path": None,
+                "error": f"Refused to modify '{os.path.basename(video.path)}': {reason}.",
+            }
         if _fingerprint_changed(video.path, video.size_bytes, video.mtime_ns, video.content_hash):
             return {
                 "original_path": video.path, "new_path": video.path,
@@ -1177,6 +1221,11 @@ class MovieLibrary:
         snapshot = txn.before_state
         after_state = txn.after_state or {}
         result = {"restored_path": current_path, "error": None, "warnings": []}
+
+        auth = _authority_error(self.folder, current_path)
+        if auth:
+            result["error"] = f"Refused to undo '{os.path.basename(current_path)}': {auth}."
+            return result
 
         # The video itself: refuse the whole undo if it's changed since
         # apply produced it - same principle as apply()'s own TOCTOU guard,
@@ -1347,6 +1396,13 @@ class MovieLibrary:
             # whatever now happens to sit at that path.
             still_valid = []
             for p in valid_paths:
+                auth = _authority_error(folder, p)
+                if auth:
+                    results.append({
+                        "original_path": p, "new_path": None,
+                        "error": f"Refused to quarantine '{os.path.basename(p)}': {auth}.",
+                    })
+                    continue
                 size, mtime_ns, content_hash = fingerprints[p]
                 if _fingerprint_changed(p, size, mtime_ns, content_hash):
                     results.append({
@@ -1613,6 +1669,13 @@ class TvLibrary:
 
     def _apply_one(self, episode: episode_scanner_module.EpisodeFile, do_tag: bool, do_rename: bool,
                    do_nfo: bool, do_thumb: bool) -> dict:
+        safe, reason = pathsafe_module.validate_mutation_target(episode.path, self.folder)
+        if not safe:
+            return {
+                "original_path": episode.path, "new_path": episode.path,
+                "tagged": False, "renamed": False, "nfo_path": None, "thumb_path": None,
+                "error": f"Refused to modify '{os.path.basename(episode.path)}': {reason}.",
+            }
         if _fingerprint_changed(episode.path, episode.size_bytes, episode.mtime_ns, episode.content_hash):
             return {
                 "original_path": episode.path, "new_path": episode.path,
@@ -1714,6 +1777,11 @@ class TvLibrary:
         after_state = txn.after_state or {}
         result = {"restored_path": current_path, "error": None, "warnings": []}
 
+        auth = _authority_error(self.folder, current_path)
+        if auth:
+            result["error"] = f"Refused to undo '{os.path.basename(current_path)}': {auth}."
+            return result
+
         if _fingerprint_changed(current_path, after_state.get("media_size"), after_state.get("media_mtime_ns"), after_state.get("media_hash")):
             result["error"] = (
                 "This file has changed since MetaMatch applied this match "
@@ -1790,7 +1858,13 @@ class TvLibrary:
                     # pre-existing show/season/episode atoms.
                     _restore_mp4_atoms(path_to_use, atom_snapshot)
                 else:
-                    # Older journal row: title/year-only best-effort restore.
+                    # Legacy 0.2.0 journal row without a full atom snapshot.
+                    # We can safely restore title/year (those WERE recorded),
+                    # but we must NOT delete tvsh/tvsn/tves/stik/©ART: an old
+                    # row can't tell whether those existed before MetaMatch
+                    # touched the file, so deleting them could destroy the
+                    # user's pre-existing metadata. Fail closed - leave the
+                    # TV-specific atoms exactly as they are and warn.
                     from mutagen.mp4 import MP4
                     audio = MP4(path_to_use)
                     changed = False
@@ -1806,12 +1880,12 @@ class TvLibrary:
                     elif "\xa9day" in audio:
                         del audio["\xa9day"]
                         changed = True
-                    for atom in ("tvsh", "tvsn", "tves", "stik", "\xa9ART"):
-                        if atom in audio:
-                            del audio[atom]
-                            changed = True
                     if changed:
                         audio.save()
+                    result.setdefault("warnings", []).append(
+                        "This file was tagged by an older MetaMatch version that didn't record the "
+                        "original show/season/episode atoms, so they were left as-is on undo rather "
+                        "than risk deleting metadata that may have pre-existed. Check them if needed.")
 
             result["restored_path"] = path_to_use
             self.journal.mark_rolled_back(txn.id)
@@ -1859,6 +1933,13 @@ class TvLibrary:
         with _locked_paths(self._mutation_locks, valid_paths):
             still_valid = []
             for p in valid_paths:
+                auth = _authority_error(folder, p)
+                if auth:
+                    results.append({
+                        "original_path": p, "new_path": None,
+                        "error": f"Refused to quarantine '{os.path.basename(p)}': {auth}.",
+                    })
+                    continue
                 size, mtime_ns, content_hash = fingerprints[p]
                 if _fingerprint_changed(p, size, mtime_ns, content_hash):
                     results.append({
@@ -1954,6 +2035,15 @@ class TvLibrary:
             return result
         result["series_name"] = details.get("name")
 
+        # Re-check authority on the series root at write time: the root was
+        # derived from an episode path recorded at scan, but the directory
+        # could have been swapped for a junction/symlink pointing outside the
+        # library since (the series-metadata analogue of the Apply TOCTOU).
+        auth = _authority_error(self.folder, series_root)
+        if auth:
+            result["error"] = f"Refused to write series metadata into '{os.path.basename(series_root)}': {auth}."
+            return result
+
         season_urls = {}
         if do_season_posters:
             for s in seasons:
@@ -1996,10 +2086,17 @@ class TvLibrary:
 
         written = []
         try:
+            if pathsafe_module.sidecar_write_is_unsafe(nfo_path):
+                result["error"] = "The existing tvshow.nfo is a symlink; refusing to write through it."
+                self.journal.mark_rolled_back(txn_id)
+                result["rolled_back"] = True
+                return result
             written.append(tv_tagger_module.write_tvshow_nfo(series_root, details))
             if do_poster and details.get("poster_url_full"):
                 poster_dest = tv_tagger_module.series_poster_path(series_root)
-                if movie_tagger_module.sidecar_is_protected(poster_dest):
+                if pathsafe_module.sidecar_write_is_unsafe(poster_dest):
+                    result["warnings"].append("Existing series poster is a symlink; left it untouched.")
+                elif movie_tagger_module.sidecar_is_protected(poster_dest):
                     result["warnings"].append("Existing series poster too large to back up; left in place.")
                 else:
                     p = tv_tagger_module.download_image(details["poster_url_full"], poster_dest)
@@ -2009,6 +2106,9 @@ class TvLibrary:
                         result["warnings"].append("Series poster download failed (nfo still written).")
             for s, url in season_urls.items():
                 season_dest = tv_tagger_module.season_poster_path(series_root, s)
+                if pathsafe_module.sidecar_write_is_unsafe(season_dest):
+                    result["warnings"].append(f"Existing season {s} poster is a symlink; left it untouched.")
+                    continue
                 if movie_tagger_module.sidecar_is_protected(season_dest):
                     result["warnings"].append(f"Existing season {s} poster too large to back up; left in place.")
                     continue

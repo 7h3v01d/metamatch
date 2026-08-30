@@ -24,6 +24,8 @@ import xml.etree.ElementTree as ET
 
 import requests
 
+from . import pathsafe
+
 from .movie_tagger import (
     sanitize_filename, _safe_move, remux_with_metadata,
     MP4_DIRECT_EXTENSIONS, FFMPEG_REMUX_EXTENSIONS, sidecar_is_protected,
@@ -233,10 +235,19 @@ def apply_episode_match(
             embed_metadata(current_path, match)
             result["tagged"] = True
         if do_nfo:
-            result["nfo_path"] = write_nfo(current_path, match)
+            nfo_dest = os.path.splitext(current_path)[0] + ".nfo"
+            if pathsafe.sidecar_write_is_unsafe(nfo_dest):
+                result.setdefault("warnings", []).append(
+                    "Left the existing .nfo untouched: it's a symlink, and MetaMatch won't "
+                    "write through a link to a file outside the library.")
+            else:
+                result["nfo_path"] = write_nfo(current_path, match)
         if do_thumb:
             thumb_dest = os.path.splitext(current_path)[0] + THUMB_SUFFIX
-            if sidecar_is_protected(thumb_dest):
+            if pathsafe.sidecar_write_is_unsafe(thumb_dest):
+                result.setdefault("warnings", []).append(
+                    "Left the existing thumbnail untouched: it's a symlink to somewhere outside the library.")
+            elif sidecar_is_protected(thumb_dest):
                 result.setdefault("warnings", []).append(
                     "Left the existing thumbnail in place: it's larger than MetaMatch can "
                     "back up for undo, so it wasn't overwritten.")

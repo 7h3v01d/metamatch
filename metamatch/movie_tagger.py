@@ -24,6 +24,8 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
+from . import pathsafe
+
 import requests
 
 _INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -310,10 +312,19 @@ def apply_movie_match(
             embed_metadata(current_path, match)
             result["tagged"] = True
         if do_nfo:
-            result["nfo_path"] = write_nfo(current_path, match)
+            nfo_dest = os.path.splitext(current_path)[0] + ".nfo"
+            if pathsafe.sidecar_write_is_unsafe(nfo_dest):
+                result.setdefault("warnings", []).append(
+                    "Left the existing .nfo untouched: it's a symlink, and MetaMatch won't "
+                    "write through a link to a file outside the library.")
+            else:
+                result["nfo_path"] = write_nfo(current_path, match)
         if do_poster:
             poster_dest = os.path.splitext(current_path)[0] + "-poster.jpg"
-            if sidecar_is_protected(poster_dest):
+            if pathsafe.sidecar_write_is_unsafe(poster_dest):
+                result.setdefault("warnings", []).append(
+                    "Left the existing poster untouched: it's a symlink to somewhere outside the library.")
+            elif sidecar_is_protected(poster_dest):
                 result.setdefault("warnings", []).append(
                     "Left the existing poster in place: it's larger than MetaMatch can "
                     "back up for undo, so it wasn't overwritten.")
