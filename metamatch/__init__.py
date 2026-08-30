@@ -24,5 +24,5 @@ score_candidate` - without pulling in the stateful library classes.
 
 from .library import MusicLibrary, MovieLibrary, TvLibrary
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = ["MusicLibrary", "MovieLibrary", "TvLibrary", "__version__"]

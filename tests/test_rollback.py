@@ -213,16 +213,19 @@ class TestMovieApplyRollback:
         atoms = MP4(target["id"])
         assert "\xa9nam" not in atoms  # title atom that apply added is gone again
 
-    def test_irreversible_remux_is_left_with_a_warning_not_a_failure(self, movie_dir, mock_movie_match, monkeypatch):
+    def test_irreversible_remux_is_flagged_recovery_required(self, movie_dir, mock_movie_match, monkeypatch):
         from metamatch import MovieLibrary
         import metamatch.movie_tagger as movie_tagger_module
+        from metamatch.journal import RECOVERY_REQUIRED
 
         lib = MovieLibrary()
         lib.scan(str(movie_dir))
         lib.match()
-        # The .mkv goes through an ffmpeg remux to embed metadata, which
-        # can't be reversed - rollback should say so, but still count as
-        # rolled back (the reversible structure is restored).
+        # The .mkv goes through an ffmpeg remux to embed metadata, which can't
+        # be reverted. Since the file still carries the applied metadata, the
+        # rollback is NOT clean - it must be flagged RECOVERY_REQUIRED, not
+        # falsely reported as ROLLED_BACK (which must mean before-state
+        # restored). This keeps the journal's state names trustworthy.
         target = [v for v in lib.videos_payload()
                   if v["filename"].endswith(".mkv")][0]
 
@@ -230,10 +233,10 @@ class TestMovieApplyRollback:
         result = lib.apply(target["id"], do_tag=True, do_rename=True, do_nfo=False, do_poster=False)
 
         assert result["error"] is not None
-        assert result["rolled_back"] is True
-        assert result["recovery_required"] is False
+        assert result["rolled_back"] is False
+        assert result["recovery_required"] is True
         assert any("remux" in w.lower() for w in result.get("warnings", []))
-        assert lib.journal.get(result["txn_id"]).status == ROLLED_BACK
+        assert lib.journal.get(result["txn_id"]).status == RECOVERY_REQUIRED
 
 
 # ---------------------------------------------------------------------------

@@ -101,6 +101,22 @@ def write_nfo(path: str, match: dict) -> str:
     return nfo_path
 
 
+# A pre-existing sidecar larger than this can't be snapshotted into the
+# journal for undo (see library._MAX_SIDECAR_SNAPSHOT_BYTES, kept in sync).
+# Rather than overwrite an original we couldn't restore, we refuse to clobber
+# it - an archival-safety choice: never destroy what we can't put back.
+MAX_RECOVERABLE_SIDECAR_BYTES = 8 * 1024 * 1024
+
+
+def sidecar_is_protected(dest: str) -> bool:
+    """True if `dest` already exists and is too large to back up for undo, so
+    it must not be overwritten. A missing/small file is fine to (over)write."""
+    try:
+        return os.path.exists(dest) and os.path.getsize(dest) > MAX_RECOVERABLE_SIDECAR_BYTES
+    except OSError:
+        return False
+
+
 def download_poster(path: str, match: dict) -> str | None:
     """Saves the movie poster as '<basename>-poster.jpg' next to the video. Returns the saved path, or None."""
     poster_url = match.get("poster_url_full") or match.get("poster_url")
@@ -109,6 +125,9 @@ def download_poster(path: str, match: dict) -> str | None:
 
     base = os.path.splitext(path)[0]
     dest = base + "-poster.jpg"
+    if sidecar_is_protected(dest):
+        # Don't overwrite a pre-existing poster we couldn't restore on undo.
+        return None
     try:
         resp = requests.get(poster_url, timeout=15)
         resp.raise_for_status()
@@ -293,7 +312,13 @@ def apply_movie_match(
         if do_nfo:
             result["nfo_path"] = write_nfo(current_path, match)
         if do_poster:
-            result["poster_path"] = download_poster(current_path, match)
+            poster_dest = os.path.splitext(current_path)[0] + "-poster.jpg"
+            if sidecar_is_protected(poster_dest):
+                result.setdefault("warnings", []).append(
+                    "Left the existing poster in place: it's larger than MetaMatch can "
+                    "back up for undo, so it wasn't overwritten.")
+            else:
+                result["poster_path"] = download_poster(current_path, match)
         if do_rename:
             new_path = rename_to_match(current_path, match)
             # Sidecars were written against the old name - rename them to

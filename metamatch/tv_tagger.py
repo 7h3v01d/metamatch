@@ -26,7 +26,7 @@ import requests
 
 from .movie_tagger import (
     sanitize_filename, _safe_move, remux_with_metadata,
-    MP4_DIRECT_EXTENSIONS, FFMPEG_REMUX_EXTENSIONS,
+    MP4_DIRECT_EXTENSIONS, FFMPEG_REMUX_EXTENSIONS, sidecar_is_protected,
 )
 
 THUMB_SUFFIX = "-thumb.jpg"
@@ -99,6 +99,8 @@ def download_thumb(path: str, match: dict) -> str | None:
     if not url:
         return None
     dest = os.path.splitext(path)[0] + THUMB_SUFFIX
+    if sidecar_is_protected(dest):
+        return None  # don't overwrite a pre-existing thumb we couldn't restore
     try:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
@@ -192,8 +194,11 @@ def write_tvshow_nfo(series_root: str, details: dict) -> str:
 
 
 def download_image(url: str, dest: str) -> str | None:
-    """Best-effort image download to `dest`; returns the path or None."""
+    """Best-effort image download to `dest`; returns the path or None. Refuses
+    to overwrite a pre-existing image too large to back up for undo."""
     if not url:
+        return None
+    if sidecar_is_protected(dest):
         return None
     try:
         resp = requests.get(url, timeout=15)
@@ -230,7 +235,13 @@ def apply_episode_match(
         if do_nfo:
             result["nfo_path"] = write_nfo(current_path, match)
         if do_thumb:
-            result["thumb_path"] = download_thumb(current_path, match)
+            thumb_dest = os.path.splitext(current_path)[0] + THUMB_SUFFIX
+            if sidecar_is_protected(thumb_dest):
+                result.setdefault("warnings", []).append(
+                    "Left the existing thumbnail in place: it's larger than MetaMatch can "
+                    "back up for undo, so it wasn't overwritten.")
+            else:
+                result["thumb_path"] = download_thumb(current_path, match)
         if do_rename:
             new_path = rename_to_match(current_path, match)
             if new_path != current_path:

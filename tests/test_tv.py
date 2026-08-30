@@ -349,7 +349,7 @@ class TestSeriesMetadata:
         assert os.path.exists(os.path.join(root, "tvshow.nfo"))
 
         undo = lib.undo_series_metadata_all()
-        assert undo["reverted"] >= 1
+        assert undo["restored"] >= 1
         assert not os.path.exists(os.path.join(root, "tvshow.nfo"))
         assert not os.path.exists(os.path.join(root, "poster.jpg"))
         assert not os.path.exists(os.path.join(root, "season01-poster.jpg"))
@@ -408,4 +408,4 @@ class TestSeriesMetadataApi:
 
         undo = app_client.post("/api/tv/series_metadata/undo")
         assert undo.status_code == 200
-        assert undo.get_json()["reverted"] >= 1
+        assert undo.get_json()["restored"] >= 1

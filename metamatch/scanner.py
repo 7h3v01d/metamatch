@@ -237,6 +237,7 @@ def scan_folder(folder: str, recursive: bool = True) -> list[TrackFile]:
         raise NotADirectoryError(f"Not a folder: {folder}")
 
     from .dedup import QUARANTINE_DIRNAME
+    from . import pathsafe
 
     results: list[TrackFile] = []
     if recursive:
@@ -247,12 +248,19 @@ def scan_folder(folder: str, recursive: bool = True) -> list[TrackFile]:
     for root, dirs, files in walker:
         # Don't walk into our own quarantine folder - a file moved there
         # to get it out of the working set shouldn't reappear on the very
-        # next scan of the same folder.
-        dirs[:] = [d for d in dirs if d != QUARANTINE_DIRNAME]
+        # next scan of the same folder. Also drop any symlinked/reparse
+        # subdirectory so a linked folder can't smuggle in external files.
+        dirs[:] = pathsafe.prune_unsafe_dirs(root, [d for d in dirs if d != QUARANTINE_DIRNAME])
         for name in files:
             ext = os.path.splitext(name)[1].lower()
             if ext in SUPPORTED_EXTENSIONS:
                 full_path = os.path.join(root, name)
+                # Filesystem-authority guard: never admit a link/reparse
+                # object or a file whose resolved path escapes the selected
+                # library root (see pathsafe.py). Tagging one would follow
+                # the link and mutate a file outside the user's authority.
+                if not pathsafe.is_safe_scan_member(full_path, folder):
+                    continue
                 try:
                     results.append(read_track(full_path))
                 except Exception:

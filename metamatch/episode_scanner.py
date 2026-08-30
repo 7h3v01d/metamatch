@@ -228,15 +228,19 @@ def scan_folder(folder: str, recursive: bool = True) -> list[EpisodeFile]:
         raise NotADirectoryError(f"Not a folder: {folder}")
 
     from .dedup import QUARANTINE_DIRNAME
+    from . import pathsafe
 
     results: list[EpisodeFile] = []
     walker = os.walk(folder) if recursive else [(folder, [], os.listdir(folder))]
 
     for root, dirs, files in walker:
-        dirs[:] = [d for d in dirs if d != QUARANTINE_DIRNAME]
+        dirs[:] = pathsafe.prune_unsafe_dirs(root, [d for d in dirs if d != QUARANTINE_DIRNAME])
         for name in files:
             if os.path.splitext(name)[1].lower() in SUPPORTED_EXTENSIONS:
                 full_path = os.path.join(root, name)
+                # Filesystem-authority guard (see pathsafe.py / scanner.py).
+                if not pathsafe.is_safe_scan_member(full_path, folder):
+                    continue
                 try:
                     results.append(read_episode(full_path))
                 except Exception:

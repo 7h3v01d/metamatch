@@ -26,6 +26,7 @@ metamatch/config.py) and .nfo/poster sidecars instead of embedded art.
 from __future__ import annotations
 
 import base64
+import contextlib
 import csv
 import io
 import math
@@ -55,6 +56,57 @@ from . import fingerprint as fingerprint_module
 # someone placed by hand), in which case undo falls back to leaving the
 # file alone rather than restoring its exact bytes - see MovieLibrary._undo_txn.
 _MAX_SIDECAR_SNAPSHOT_BYTES = 8 * 1024 * 1024
+
+
+class _PathLockRegistry:
+    """Hands out one lock per canonical file path so a mutating operation
+    (Apply / Undo / Quarantine) can hold it for the WHOLE sequence -
+    fingerprint check, journal begin, mutate, commit/rollback, refresh -
+    making same-file operations mutually exclusive while still allowing
+    different files to proceed concurrently.
+
+    This matters because Flask services requests concurrently: without it,
+    two Apply requests on the same file can both pass the stale-object check
+    and journal 'begin' before either mutates, then race - one renames the
+    file out from under the other, whose rollback then fails and manufactures
+    a bogus RECOVERY_REQUIRED incident (and concurrent writers to the same
+    media container are worse still). The lock is acquired BEFORE the
+    stale-object check so a waiting caller re-checks against the file's real
+    post-operation state and cleanly aborts ('file changed - rescan') instead
+    of carrying stale information through.
+
+    Keyed by realpath so two different pathnames for the same object (e.g. a
+    path and its post-rename name) don't get independent locks mid-sequence."""
+
+    def __init__(self):
+        self._locks: dict[str, threading.RLock] = {}
+        self._guard = threading.Lock()
+
+    def get(self, path: str) -> threading.RLock:
+        try:
+            key = os.path.realpath(os.path.abspath(path))
+        except OSError:
+            key = os.path.abspath(path)
+        with self._guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._locks[key] = lock
+            return lock
+
+
+@contextlib.contextmanager
+def _locked_paths(registry: _PathLockRegistry, paths):
+    """Hold the mutation locks for several paths at once (a bulk Quarantine
+    moving many files), acquired in a canonical (sorted realpath) order so two
+    concurrent bulk operations can't deadlock by grabbing the same locks in
+    opposite orders. Single-file Apply/Undo take one lock each, so they can't
+    deadlock against this regardless."""
+    keys = sorted({os.path.realpath(os.path.abspath(p)) for p in paths})
+    with contextlib.ExitStack() as stack:
+        for key in keys:
+            stack.enter_context(registry.get(key))
+        yield
 
 ProgressCallback = Optional[Callable[[int, int], None]]
 
@@ -306,9 +358,17 @@ def _rollback_movie_apply(path: str, pre_apply: dict, result: dict) -> "tuple[bo
                 fully_restored = False
                 warnings.append(f"Could not revert embedded metadata on '{os.path.basename(path)}': {e}")
         else:
+            # The embed went through an ffmpeg remux, which rewrote the source
+            # file in place and can't be reverted without the original bytes.
+            # The file therefore still carries the applied metadata, so this is
+            # NOT a clean rollback: flag it as not fully restored so the
+            # transaction becomes RECOVERY_REQUIRED, keeping ROLLED_BACK honest
+            # (it must mean "before-state restored").
+            fully_restored = False
             warnings.append(
                 "Embedded metadata was written via an ffmpeg remux, which can't be "
-                "automatically reverted - the video was left as remuxed."
+                "automatically reverted - the video still carries the applied metadata "
+                "and needs a manual check."
             )
 
     for key, had_key, bytes_key, label in (
@@ -383,13 +443,35 @@ def _revert_series_artifacts(snapshot_artifacts: dict, fingerprints: dict | None
     return fully_restored, warnings
 
 
+_TV_MP4_ATOMS = ("\xa9nam", "\xa9day", "\xa9ART", "tvsh", "tvsn", "tves", "stik")
+
+
+def _restore_mp4_atoms(path: str, atom_snapshot: "dict | None") -> None:
+    """Restore every TV MP4 atom to its snapshotted prior state: set atoms
+    that existed back to their exact value, and delete only those that didn't
+    exist before the apply. This replaces the old "delete the whole set"
+    behaviour, which destroyed pre-existing show/season/episode atoms on undo.
+    Raises on MP4 I/O failure so callers can flag the rollback as incomplete."""
+    from mutagen.mp4 import MP4
+    audio = MP4(path)
+    for atom in _TV_MP4_ATOMS:
+        prior = atom_snapshot.get(atom)
+        if prior is None:
+            if atom in audio:
+                del audio[atom]
+        else:
+            audio[atom] = prior
+    audio.save()
+
+
 def _rollback_tv_apply(path: str, pre_apply: dict, result: dict) -> "tuple[bool, list]":
     """Compensate a failed episode apply, in place at `path`. Mirrors
     _rollback_movie_apply: reverts mp4/m4v atoms and created/overwritten
     .nfo/-thumb.jpg sidecars; an ffmpeg remux can't be reversed without the
     original bytes, so it's surfaced as a warning. Returns (fully_restored,
     warnings). The episode embed writes several atoms (show/season/episode/
-    stik) beyond title/year, so the revert clears that whole set."""
+    stik) beyond title/year, so the revert restores that whole set to its
+    snapshotted prior state rather than deleting it."""
     warnings: list = []
     fully_restored = True
     ext = os.path.splitext(path)[1].lower()
@@ -397,27 +479,37 @@ def _rollback_tv_apply(path: str, pre_apply: dict, result: dict) -> "tuple[bool,
     if result.get("tagged"):
         if ext in (".mp4", ".m4v"):
             try:
-                from mutagen.mp4 import MP4
-                audio = MP4(path)
-                if pre_apply.get("tag_title"):
-                    audio["\xa9nam"] = [pre_apply["tag_title"]]
-                elif "\xa9nam" in audio:
-                    del audio["\xa9nam"]
-                if pre_apply.get("tag_year"):
-                    audio["\xa9day"] = [str(pre_apply["tag_year"])]
-                elif "\xa9day" in audio:
-                    del audio["\xa9day"]
-                for atom in ("tvsh", "tvsn", "tves", "stik", "\xa9ART"):
-                    if atom in audio:
-                        del audio[atom]
-                audio.save()
+                atom_snapshot = pre_apply.get("mp4_atoms")
+                if atom_snapshot is not None:
+                    _restore_mp4_atoms(path, atom_snapshot)
+                else:
+                    # Older journal row without a full atom snapshot: fall back
+                    # to the title/year-only behaviour (best effort).
+                    from mutagen.mp4 import MP4
+                    audio = MP4(path)
+                    if pre_apply.get("tag_title"):
+                        audio["\xa9nam"] = [pre_apply["tag_title"]]
+                    elif "\xa9nam" in audio:
+                        del audio["\xa9nam"]
+                    if pre_apply.get("tag_year"):
+                        audio["\xa9day"] = [str(pre_apply["tag_year"])]
+                    elif "\xa9day" in audio:
+                        del audio["\xa9day"]
+                    for atom in ("tvsh", "tvsn", "tves", "stik", "\xa9ART"):
+                        if atom in audio:
+                            del audio[atom]
+                    audio.save()
             except Exception as e:
                 fully_restored = False
                 warnings.append(f"Could not revert embedded metadata on '{os.path.basename(path)}': {e}")
         else:
+            # See _rollback_movie_apply: a remux can't be reverted, so the
+            # file still carries the applied metadata - not a clean rollback.
+            fully_restored = False
             warnings.append(
                 "Embedded metadata was written via an ffmpeg remux, which can't be "
-                "automatically reverted - the video was left as remuxed."
+                "automatically reverted - the video still carries the applied metadata "
+                "and needs a manual check."
             )
 
     for key, had_key, bytes_key, label in (
@@ -458,6 +550,7 @@ class MusicLibrary:
         self.order: list[str] = []
         self.match_progress: dict = {"running": False, "done": 0, "total": 0}
         self._lock = threading.RLock()
+        self._mutation_locks = _PathLockRegistry()
 
         self.journal = journal or journal_module.Journal(journal_module.DEFAULT_JOURNAL_PATH)
         # Any transaction still "pending" here means the process died
@@ -560,7 +653,8 @@ class MusicLibrary:
             raise KeyError(f"Unknown track: {track_id}")
         if not track.match:
             raise ValueError("This track has no match to apply.")
-        return self._apply_one(track, do_tag, do_rename, do_art)
+        with self._mutation_locks.get(track.path):
+            return self._apply_one(track, do_tag, do_rename, do_art)
 
     def apply_all(self, do_tag: bool = True, do_rename: bool = True, do_art: bool = False,
                   min_confidence: float = 75.0) -> dict:
@@ -573,7 +667,8 @@ class MusicLibrary:
         for track in candidates:
             if not track.match or track.match.get("confidence", 0) < min_confidence:
                 continue
-            results.append(self._apply_one(track, do_tag, do_rename, do_art))
+            with self._mutation_locks.get(track.path):
+                results.append(self._apply_one(track, do_tag, do_rename, do_art))
 
         succeeded = sum(1 for r in results if not r["error"])
         return {
@@ -674,11 +769,15 @@ class MusicLibrary:
         txn = self.journal.get_active_for_path("music", track_id)
         if not txn:
             raise ValueError("Nothing to undo for this file.")
-        return self._undo_txn(txn)
+        with self._mutation_locks.get(txn.current_path):
+            return self._undo_txn(txn)
 
     def undo_all(self) -> dict:
         txns = self.journal.list_undoable("music", folder=self.folder)
-        results = [self._undo_txn(t) for t in txns]
+        results = []
+        for t in txns:
+            with self._mutation_locks.get(t.current_path):
+                results.append(self._undo_txn(t))
         succeeded = sum(1 for r in results if not r["error"])
         return {"restored": succeeded, "results": results}
 
@@ -751,23 +850,29 @@ class MusicLibrary:
         rejected = [p for p in paths if p not in valid_paths]
         results = []
 
-        # A file that's tracked but no longer matches what was recorded at
-        # scan time (replaced/modified since) is refused rather than moved -
-        # the same TOCTOU guard apply() already uses, applied here too so
-        # quarantine can't be tricked into moving unrelated content that
-        # happens to now sit at a previously-scanned path.
-        still_valid = []
-        for p in valid_paths:
-            size, mtime_ns, content_hash = fingerprints[p]
-            if _fingerprint_changed(p, size, mtime_ns, content_hash):
-                results.append({
-                    "original_path": p, "new_path": None,
-                    "error": "File changed on disk since it was scanned - rescan before quarantining.",
-                })
-            elif os.path.isfile(p):
-                still_valid.append(p)
+        # Hold each target file's mutation lock across its stale-check and
+        # move, so a concurrent Apply/Undo on the same file can't interleave
+        # with quarantining it (which would race the file out from under the
+        # other operation). Released before the in-memory cleanup below.
+        with _locked_paths(self._mutation_locks, valid_paths):
+            # A file that's tracked but no longer matches what was recorded at
+            # scan time (replaced/modified since) is refused rather than moved -
+            # the same TOCTOU guard apply() already uses, applied here too so
+            # quarantine can't be tricked into moving unrelated content that
+            # happens to now sit at a previously-scanned path.
+            still_valid = []
+            for p in valid_paths:
+                size, mtime_ns, content_hash = fingerprints[p]
+                if _fingerprint_changed(p, size, mtime_ns, content_hash):
+                    results.append({
+                        "original_path": p, "new_path": None,
+                        "error": "File changed on disk since it was scanned - rescan before quarantining.",
+                    })
+                elif os.path.isfile(p):
+                    still_valid.append(p)
 
-        results = dedup_module.quarantine(still_valid, folder) + results
+            results = dedup_module.quarantine(still_valid, folder) + results
+
         for p in rejected:
             results.append({
                 "original_path": p, "new_path": None,
@@ -815,6 +920,7 @@ class MovieLibrary:
         self.order: list[str] = []
         self.match_progress: dict = {"running": False, "done": 0, "total": 0, "error": None}
         self._lock = threading.RLock()
+        self._mutation_locks = _PathLockRegistry()
 
         self.journal = journal or journal_module.Journal(journal_module.DEFAULT_JOURNAL_PATH)
         self.recovered_transactions = self.journal.recover("movie")
@@ -936,7 +1042,8 @@ class MovieLibrary:
             raise KeyError(f"Unknown file: {video_id}")
         if not video.match:
             raise ValueError("This file has no match to apply.")
-        return self._apply_one(video, do_tag, do_rename, do_nfo, do_poster)
+        with self._mutation_locks.get(video.path):
+            return self._apply_one(video, do_tag, do_rename, do_nfo, do_poster)
 
     def apply_all(self, do_tag: bool = False, do_rename: bool = True, do_nfo: bool = True,
                   do_poster: bool = True, min_confidence: float = 75.0) -> dict:
@@ -948,7 +1055,8 @@ class MovieLibrary:
         for video in candidates:
             if not video.match or video.match.get("confidence", 0) < min_confidence:
                 continue
-            results.append(self._apply_one(video, do_tag, do_rename, do_nfo, do_poster))
+            with self._mutation_locks.get(video.path):
+                results.append(self._apply_one(video, do_tag, do_rename, do_nfo, do_poster))
 
         succeeded = sum(1 for r in results if not r["error"])
         return {
@@ -1051,11 +1159,15 @@ class MovieLibrary:
         txn = self.journal.get_active_for_path("movie", video_id)
         if not txn:
             raise ValueError("Nothing to undo for this file.")
-        return self._undo_txn(txn)
+        with self._mutation_locks.get(txn.current_path):
+            return self._undo_txn(txn)
 
     def undo_all(self) -> dict:
         txns = self.journal.list_undoable("movie", folder=self.folder)
-        results = [self._undo_txn(t) for t in txns]
+        results = []
+        for t in txns:
+            with self._mutation_locks.get(t.current_path):
+                results.append(self._undo_txn(t))
         succeeded = sum(1 for r in results if not r["error"])
         return {"restored": succeeded, "results": results}
 
@@ -1227,34 +1339,38 @@ class MovieLibrary:
         rejected = [p for p in paths if p not in valid_paths]
         results = []
 
-        # Same TOCTOU guard apply() uses: refuse a file that no longer
-        # matches what was recorded at scan time, rather than quarantining
-        # whatever now happens to sit at that path.
-        still_valid = []
-        for p in valid_paths:
-            size, mtime_ns, content_hash = fingerprints[p]
-            if _fingerprint_changed(p, size, mtime_ns, content_hash):
-                results.append({
-                    "original_path": p, "new_path": None,
-                    "error": "File changed on disk since it was scanned - rescan before quarantining.",
-                })
-            elif os.path.isfile(p):
-                still_valid.append(p)
+        # Hold each target file's mutation lock across its stale-check and move
+        # (see MusicLibrary.quarantine for why).
+        with _locked_paths(self._mutation_locks, valid_paths):
+            # Same TOCTOU guard apply() uses: refuse a file that no longer
+            # matches what was recorded at scan time, rather than quarantining
+            # whatever now happens to sit at that path.
+            still_valid = []
+            for p in valid_paths:
+                size, mtime_ns, content_hash = fingerprints[p]
+                if _fingerprint_changed(p, size, mtime_ns, content_hash):
+                    results.append({
+                        "original_path": p, "new_path": None,
+                        "error": "File changed on disk since it was scanned - rescan before quarantining.",
+                    })
+                elif os.path.isfile(p):
+                    still_valid.append(p)
 
-        # Sweep up any .nfo/poster sidecars sitting next to a *verified*
-        # flagged video so they move together instead of leaving orphans
-        # behind. Sidecar paths are always derived here from a video path
-        # we ourselves discovered during scan, never taken from the caller.
-        all_paths = []
-        for p in still_valid:
-            all_paths.append(p)
-            base = os.path.splitext(p)[0]
-            for suffix in (".nfo", "-poster.jpg"):
-                sidecar = base + suffix
-                if os.path.isfile(sidecar):
-                    all_paths.append(sidecar)
+            # Sweep up any .nfo/poster sidecars sitting next to a *verified*
+            # flagged video so they move together instead of leaving orphans
+            # behind. Sidecar paths are always derived here from a video path
+            # we ourselves discovered during scan, never taken from the caller.
+            all_paths = []
+            for p in still_valid:
+                all_paths.append(p)
+                base = os.path.splitext(p)[0]
+                for suffix in (".nfo", "-poster.jpg"):
+                    sidecar = base + suffix
+                    if os.path.isfile(sidecar):
+                        all_paths.append(sidecar)
 
-        results = dedup_module.quarantine(all_paths, folder) + results
+            results = dedup_module.quarantine(all_paths, folder) + results
+
         for p in rejected:
             results.append({
                 "original_path": p, "new_path": None,
@@ -1309,6 +1425,7 @@ class TvLibrary:
         self.order: list[str] = []
         self.match_progress: dict = {"running": False, "done": 0, "total": 0, "error": None}
         self._lock = threading.RLock()
+        self._mutation_locks = _PathLockRegistry()
 
         self.journal = journal or journal_module.Journal(journal_module.DEFAULT_JOURNAL_PATH)
         # Episode applies use kind "tv"; series-level artifacts (tvshow.nfo,
@@ -1406,9 +1523,10 @@ class TvLibrary:
 
     # ----------------------------------------------------------- apply
     def _read_original_atoms(self, path: str) -> tuple:
-        """The pre-apply title/year embedded in an mp4/m4v, so a rollback can
-        put them back. Non-mp4 containers return (None, None) - their embed
-        goes through a remux that rollback can't reverse anyway."""
+        """The pre-apply title/year embedded in an mp4/m4v (kept for backward
+        compatibility with older journal rows). Non-mp4 containers return
+        (None, None) - their embed goes through a remux that rollback can't
+        reverse anyway."""
         if os.path.splitext(path)[1].lower() not in (".mp4", ".m4v"):
             return (None, None)
         try:
@@ -1421,6 +1539,27 @@ class TvLibrary:
         except Exception:
             return (None, None)
 
+    def _read_original_mp4_atoms(self, path: str) -> "dict | None":
+        """Snapshot every MP4 atom a TV apply might overwrite, so undo/rollback
+        can restore each to its EXACT prior value instead of blindly deleting
+        it. An episode apply writes show/season/episode/media-kind/artist atoms
+        on top of title/year - a file that was already tagged (a re-tag, or a
+        different tagger's output) has real values in those atoms, and deleting
+        them on undo is data loss. Each atom maps to its prior list value, or
+        None if it wasn't present. Returns None for non-mp4 containers (the
+        remux path can't be reverted atom-by-atom anyway)."""
+        if os.path.splitext(path)[1].lower() not in (".mp4", ".m4v"):
+            return None
+        try:
+            from mutagen.mp4 import MP4
+            audio = MP4(path)
+            snap = {}
+            for atom in _TV_MP4_ATOMS:
+                snap[atom] = list(audio[atom]) if atom in audio else None
+            return snap
+        except Exception:
+            return None
+
     def _snapshot_original(self, episode: episode_scanner_module.EpisodeFile) -> dict:
         base = os.path.splitext(episode.path)[0]
         nfo_path = base + ".nfo"
@@ -1431,8 +1570,11 @@ class TvLibrary:
         tag_title, tag_year = self._read_original_atoms(episode.path)
 
         return {
+            # tag_title/tag_year kept for older-journal-row compatibility;
+            # mp4_atoms is the authoritative full snapshot used by rollback/undo.
             "tag_title": tag_title,
             "tag_year": tag_year,
+            "mp4_atoms": self._read_original_mp4_atoms(episode.path),
             "had_nfo": os.path.exists(nfo_path),
             "nfo_bytes_b64": _b64_or_none(nfo_bytes),
             "had_thumb": os.path.exists(thumb_path),
@@ -1447,7 +1589,8 @@ class TvLibrary:
             raise KeyError(f"Unknown file: {episode_id}")
         if not episode.match:
             raise ValueError("This file has no match to apply.")
-        return self._apply_one(episode, do_tag, do_rename, do_nfo, do_thumb)
+        with self._mutation_locks.get(episode.path):
+            return self._apply_one(episode, do_tag, do_rename, do_nfo, do_thumb)
 
     def apply_all(self, do_tag: bool = False, do_rename: bool = True, do_nfo: bool = True,
                   do_thumb: bool = True, min_confidence: float = 75.0) -> dict:
@@ -1459,7 +1602,8 @@ class TvLibrary:
         for episode in candidates:
             if not episode.match or episode.match.get("confidence", 0) < min_confidence:
                 continue
-            results.append(self._apply_one(episode, do_tag, do_rename, do_nfo, do_thumb))
+            with self._mutation_locks.get(episode.path):
+                results.append(self._apply_one(episode, do_tag, do_rename, do_nfo, do_thumb))
 
         succeeded = sum(1 for r in results if not r["error"])
         return {
@@ -1551,11 +1695,15 @@ class TvLibrary:
         txn = self.journal.get_active_for_path("tv", episode_id)
         if not txn:
             raise ValueError("Nothing to undo for this file.")
-        return self._undo_txn(txn)
+        with self._mutation_locks.get(txn.current_path):
+            return self._undo_txn(txn)
 
     def undo_all(self) -> dict:
         txns = self.journal.list_undoable("tv", folder=self.folder)
-        results = [self._undo_txn(t) for t in txns]
+        results = []
+        for t in txns:
+            with self._mutation_locks.get(t.current_path):
+                results.append(self._undo_txn(t))
         succeeded = sum(1 for r in results if not r["error"])
         return {"restored": succeeded, "results": results}
 
@@ -1635,28 +1783,35 @@ class TvLibrary:
 
             ext = os.path.splitext(path_to_use)[1].lower()
             if ext in (".mp4", ".m4v"):
-                from mutagen.mp4 import MP4
-                audio = MP4(path_to_use)
-                changed = False
-                if snapshot.get("tag_title"):
-                    audio["\xa9nam"] = [snapshot["tag_title"]]
-                    changed = True
-                elif "\xa9nam" in audio:
-                    del audio["\xa9nam"]
-                    changed = True
-                if snapshot.get("tag_year"):
-                    audio["\xa9day"] = [str(snapshot["tag_year"])]
-                    changed = True
-                elif "\xa9day" in audio:
-                    del audio["\xa9day"]
-                    changed = True
-                # Clear the TV-only atoms an apply added.
-                for atom in ("tvsh", "tvsn", "tves", "stik", "\xa9ART"):
-                    if atom in audio:
-                        del audio[atom]
+                atom_snapshot = snapshot.get("mp4_atoms")
+                if atom_snapshot is not None:
+                    # Restore every atom to its exact prior value (deleting only
+                    # atoms that didn't exist before apply) - never blindly drop
+                    # pre-existing show/season/episode atoms.
+                    _restore_mp4_atoms(path_to_use, atom_snapshot)
+                else:
+                    # Older journal row: title/year-only best-effort restore.
+                    from mutagen.mp4 import MP4
+                    audio = MP4(path_to_use)
+                    changed = False
+                    if snapshot.get("tag_title"):
+                        audio["\xa9nam"] = [snapshot["tag_title"]]
                         changed = True
-                if changed:
-                    audio.save()
+                    elif "\xa9nam" in audio:
+                        del audio["\xa9nam"]
+                        changed = True
+                    if snapshot.get("tag_year"):
+                        audio["\xa9day"] = [str(snapshot["tag_year"])]
+                        changed = True
+                    elif "\xa9day" in audio:
+                        del audio["\xa9day"]
+                        changed = True
+                    for atom in ("tvsh", "tvsn", "tves", "stik", "\xa9ART"):
+                        if atom in audio:
+                            del audio[atom]
+                            changed = True
+                    if changed:
+                        audio.save()
 
             result["restored_path"] = path_to_use
             self.journal.mark_rolled_back(txn.id)
@@ -1699,27 +1854,31 @@ class TvLibrary:
         rejected = [p for p in paths if p not in valid_paths]
         results = []
 
-        still_valid = []
-        for p in valid_paths:
-            size, mtime_ns, content_hash = fingerprints[p]
-            if _fingerprint_changed(p, size, mtime_ns, content_hash):
-                results.append({
-                    "original_path": p, "new_path": None,
-                    "error": "File changed on disk since it was scanned - rescan before quarantining.",
-                })
-            elif os.path.isfile(p):
-                still_valid.append(p)
+        # Hold each target file's mutation lock across its stale-check and move
+        # (see MusicLibrary.quarantine for why).
+        with _locked_paths(self._mutation_locks, valid_paths):
+            still_valid = []
+            for p in valid_paths:
+                size, mtime_ns, content_hash = fingerprints[p]
+                if _fingerprint_changed(p, size, mtime_ns, content_hash):
+                    results.append({
+                        "original_path": p, "new_path": None,
+                        "error": "File changed on disk since it was scanned - rescan before quarantining.",
+                    })
+                elif os.path.isfile(p):
+                    still_valid.append(p)
 
-        all_paths = []
-        for p in still_valid:
-            all_paths.append(p)
-            base = os.path.splitext(p)[0]
-            for suffix in (".nfo", tv_tagger_module.THUMB_SUFFIX):
-                sidecar = base + suffix
-                if os.path.isfile(sidecar):
-                    all_paths.append(sidecar)
+            all_paths = []
+            for p in still_valid:
+                all_paths.append(p)
+                base = os.path.splitext(p)[0]
+                for suffix in (".nfo", tv_tagger_module.THUMB_SUFFIX):
+                    sidecar = base + suffix
+                    if os.path.isfile(sidecar):
+                        all_paths.append(sidecar)
 
-        results = dedup_module.quarantine(all_paths, folder) + results
+            results = dedup_module.quarantine(all_paths, folder) + results
+
         for p in rejected:
             results.append({
                 "original_path": p, "new_path": None,
@@ -1839,14 +1998,21 @@ class TvLibrary:
         try:
             written.append(tv_tagger_module.write_tvshow_nfo(series_root, details))
             if do_poster and details.get("poster_url_full"):
-                p = tv_tagger_module.download_image(details["poster_url_full"],
-                                                    tv_tagger_module.series_poster_path(series_root))
-                if p:
-                    written.append(p)
+                poster_dest = tv_tagger_module.series_poster_path(series_root)
+                if movie_tagger_module.sidecar_is_protected(poster_dest):
+                    result["warnings"].append("Existing series poster too large to back up; left in place.")
                 else:
-                    result["warnings"].append("Series poster download failed (nfo still written).")
+                    p = tv_tagger_module.download_image(details["poster_url_full"], poster_dest)
+                    if p:
+                        written.append(p)
+                    else:
+                        result["warnings"].append("Series poster download failed (nfo still written).")
             for s, url in season_urls.items():
-                p = tv_tagger_module.download_image(url, tv_tagger_module.season_poster_path(series_root, s))
+                season_dest = tv_tagger_module.season_poster_path(series_root, s)
+                if movie_tagger_module.sidecar_is_protected(season_dest):
+                    result["warnings"].append(f"Existing season {s} poster too large to back up; left in place.")
+                    continue
+                p = tv_tagger_module.download_image(url, season_dest)
                 if p:
                     written.append(p)
                 else:
@@ -1868,19 +2034,37 @@ class TvLibrary:
         return result
 
     def undo_series_metadata_all(self) -> dict:
-        """Revert every series-metadata write (deletes tvshow.nfo/posters we
-        created, restores any we overwrote), skipping artifacts the user has
-        since changed."""
-        txns = self.journal.list_undoable("tv_series", folder=None)
+        """Revert every series-metadata write for the CURRENT TV library
+        (deletes tvshow.nfo/posters we created, restores any we overwrote),
+        skipping artifacts the user has since changed. Scoped to self.folder
+        so an Undo in one library can't reach into another that shares this
+        (deliberately shared, persistent) journal."""
+        txns = self.journal.list_undoable("tv_series", folder=self.folder)
         results = []
+        restored_count = 0
+        failed_count = 0
         for txn in txns:
             snap = (txn.before_state or {}).get("artifacts", {})
             fps = (txn.after_state or {}).get("fingerprints", {})
             ok, warns = _revert_series_artifacts(snap, fingerprints=fps)
-            self.journal.mark_rolled_back(txn.id)
+            # Terminal state must reflect the actual outcome: only a clean
+            # revert is ROLLED_BACK. A failed compensation left files on disk,
+            # so it becomes RECOVERY_REQUIRED (with the warnings persisted) -
+            # never terminalised as a successful rollback.
+            if ok:
+                self.journal.mark_rolled_back(txn.id)
+                restored_count += 1
+            else:
+                self.journal.mark_recovery_required(
+                    txn.id, {"note": "series-metadata undo couldn't fully revert files.",
+                             "warnings": warns})
+                failed_count += 1
             results.append({"series_root": (txn.operation or {}).get("series_root"),
                             "restored": ok, "warnings": warns})
-        return {"reverted": len(results), "results": results}
+        return {
+            "attempted": len(results), "restored": restored_count, "failed": failed_count,
+            "results": results,
+        }
 
     # ----------------------------------------------------------- export
     def export_csv(self) -> str:

@@ -1302,7 +1302,7 @@ tvUndoAllBtn.addEventListener("click", async () => {
     // Also revert any series-level metadata (tvshow.nfo / posters) written.
     const sResp = await fetch("/api/tv/series_metadata/undo", { method: "POST" });
     const sData = await sResp.json();
-    const seriesReverted = sResp.ok ? (sData.reverted || 0) : 0;
+    const seriesReverted = sResp.ok ? (sData.restored || 0) : 0;
     const parts = [`${data.restored} file(s)`];
     if (seriesReverted > 0) parts.push(`${seriesReverted} series' metadata`);
     showToast(`Reverted ${parts.join(" and ")}.`);

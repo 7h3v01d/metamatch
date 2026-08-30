@@ -168,18 +168,22 @@ def scan_folder(folder: str, recursive: bool = True) -> list[VideoFile]:
         raise NotADirectoryError(f"Not a folder: {folder}")
 
     from .dedup import QUARANTINE_DIRNAME
+    from . import pathsafe
 
     results: list[VideoFile] = []
     walker = os.walk(folder) if recursive else [(folder, [], os.listdir(folder))]
 
     for root, dirs, files in walker:
         # Don't walk into our own quarantine folder - see the matching
-        # comment in scanner.py for why.
-        dirs[:] = [d for d in dirs if d != QUARANTINE_DIRNAME]
+        # comment in scanner.py for why. Also drop linked/reparse subdirs.
+        dirs[:] = pathsafe.prune_unsafe_dirs(root, [d for d in dirs if d != QUARANTINE_DIRNAME])
         for name in files:
             ext = os.path.splitext(name)[1].lower()
             if ext in SUPPORTED_EXTENSIONS:
                 full_path = os.path.join(root, name)
+                # Filesystem-authority guard (see pathsafe.py / scanner.py).
+                if not pathsafe.is_safe_scan_member(full_path, folder):
+                    continue
                 try:
                     results.append(read_video(full_path))
                 except Exception:
