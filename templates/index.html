@@ -43,7 +43,22 @@
     <strong id="recoveryBannerTitle"></strong>
     <p id="recoveryBannerDetail"></p>
   </div>
+  <button class="btn btn-ghost" id="recoveryBannerReview" hidden>Review</button>
   <button class="btn btn-ghost" id="recoveryBannerDismiss">Dismiss</button>
+</div>
+
+<div class="recovery-panel" id="recoveryPanel" hidden>
+  <div class="recovery-panel-header">
+    <div>
+      <strong>Files that may need a manual check</strong>
+      <p>Each of these was left mid-operation and couldn't be automatically restored. Fix the file by hand if needed, then mark it resolved so it stops reappearing.</p>
+    </div>
+    <div class="recovery-panel-actions">
+      <button class="btn btn-ghost" id="recoveryResolveAllBtn">Mark all resolved</button>
+      <button class="btn btn-ghost" id="recoveryPanelClose" type="button" aria-label="Close">&times;</button>
+    </div>
+  </div>
+  <div class="recovery-panel-list" id="recoveryPanelList"></div>
 </div>
 
 

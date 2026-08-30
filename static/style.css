@@ -200,6 +200,80 @@ main {
 }
 .recovery-banner .btn { flex-shrink: 0; }
 
+/* Recovery panel: the reviewable list behind the banner's "Review" button.
+   Same alarm palette as the attention banner, but a full panel so each
+   needs-attention item can be shown and individually cleared. */
+.recovery-panel {
+  background: var(--panel);
+  border: 1px solid var(--red);
+  border-left: 4px solid var(--red);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  margin-bottom: 4px;
+}
+.recovery-panel[hidden] { display: none; }
+.recovery-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+.recovery-panel-header strong {
+  display: block;
+  color: var(--red);
+  font-size: 13.5px;
+  letter-spacing: 0.02em;
+  margin-bottom: 4px;
+}
+.recovery-panel-header p {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  line-height: 1.6;
+  max-width: 70ch;
+}
+.recovery-panel-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+  align-items: center;
+}
+.recovery-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border-soft);
+}
+.recovery-item-text { min-width: 0; }
+.recovery-item-name {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text);
+  word-break: break-all;
+}
+.recovery-item-kind {
+  display: inline-block;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 8px;
+}
+.recovery-item-msg {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  line-height: 1.55;
+}
+
 .panel {
   background: var(--panel);
   border: 1px solid var(--border-soft);

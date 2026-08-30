@@ -818,6 +818,8 @@ scanDupesBtn.addEventListener("click", async () => {
 
 /* ---------------------------- Crash recovery ---------------------------- */
 
+let NEEDS_ATTENTION = [];
+
 async function checkRecoveryNotices() {
   try {
     const resp = await fetch("/api/recovery");
@@ -826,23 +828,28 @@ async function checkRecoveryNotices() {
     const banner = el("recoveryBanner");
     const title = el("recoveryBannerTitle");
     const detail = el("recoveryBannerDetail");
+    const reviewBtn = el("recoveryBannerReview");
 
-    const attention = data.needs_attention || [];
+    NEEDS_ATTENTION = data.needs_attention || [];
     const startup = [...(data.music || []), ...(data.movies || []), ...(data.tv || [])];
 
-    if (attention.length > 0) {
+    if (NEEDS_ATTENTION.length > 0) {
       // Files that may be left inconsistent and couldn't be auto-restored -
       // the serious case. Persists across restarts until resolved.
       banner.classList.add("attention");
-      title.textContent = `${attention.length} file${attention.length === 1 ? "" : "s"} may need a manual check after an interrupted operation`;
-      const names = attention.slice(0, 5).map(n => (n.original_path || n.current_path || "").split("/").pop()).filter(Boolean).join(", ");
-      const more = attention.length > 5 ? ` and ${attention.length - 5} more` : "";
-      detail.textContent = `MetaMatch couldn't fully undo a failed change to: ${names}${more}. Check each file's tags, filename, and any .nfo/poster sidecars by hand.`;
+      reviewBtn.hidden = false;
+      title.textContent = `${NEEDS_ATTENTION.length} file${NEEDS_ATTENTION.length === 1 ? "" : "s"} may need a manual check after an interrupted operation`;
+      const names = NEEDS_ATTENTION.slice(0, 5).map(n => (n.original_path || n.current_path || "").split("/").pop()).filter(Boolean).join(", ");
+      const more = NEEDS_ATTENTION.length > 5 ? ` and ${NEEDS_ATTENTION.length - 5} more` : "";
+      detail.textContent = `MetaMatch couldn't fully undo a failed change to: ${names}${more}. Review each one, fix it by hand if needed, then mark it resolved.`;
       banner.hidden = false;
+      renderRecoveryPanel();  // keep the panel in sync if it's open
       return;
     }
 
-    if (startup.length === 0) return;
+    reviewBtn.hidden = true;
+    el("recoveryPanel").hidden = true;
+    if (startup.length === 0) { banner.hidden = true; return; }
 
     // Milder case: something was interrupted, but nothing was necessarily
     // left half-changed.
@@ -857,8 +864,85 @@ async function checkRecoveryNotices() {
   }
 }
 
+function recoveryItemMessage(item) {
+  const info = item.rollback_info || {};
+  if (info.note) return info.note;
+  if (info.apply_error) return `Apply failed: ${info.apply_error}`;
+  return "Left in an unverified state after an interrupted operation.";
+}
+
+function renderRecoveryPanel() {
+  const list = el("recoveryPanelList");
+  if (NEEDS_ATTENTION.length === 0) {
+    el("recoveryPanel").hidden = true;
+    return;
+  }
+  list.innerHTML = NEEDS_ATTENTION.map(item => {
+    const path = item.original_path || item.current_path || "(unknown file)";
+    const name = path.split("/").pop() || path;
+    return `
+      <div class="recovery-item">
+        <div class="recovery-item-text">
+          <div><span class="recovery-item-name">${escapeHtml(name)}</span><span class="recovery-item-kind">${escapeHtml(item.kind || "")}</span></div>
+          <p class="recovery-item-msg">${escapeHtml(path)}</p>
+          <p class="recovery-item-msg">${escapeHtml(recoveryItemMessage(item))}</p>
+        </div>
+        <button class="btn btn-ghost recovery-resolve-btn" data-txn="${item.id}">Mark resolved</button>
+      </div>
+    `;
+  }).join("");
+
+  list.querySelectorAll(".recovery-resolve-btn").forEach(btn => {
+    btn.addEventListener("click", () => resolveRecovery(parseInt(btn.dataset.txn, 10), btn));
+  });
+}
+
+async function resolveRecovery(txnId, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const resp = await fetch("/api/recovery/resolve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ txn_id: txnId }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Couldn't resolve that item.");
+    showToast("Marked resolved.");
+    await checkRecoveryNotices();  // refetch; hides banner/panel when the list empties
+  } catch (e) {
+    showToast(e.message, true);
+    if (btn) btn.disabled = false;
+  }
+}
+
+el("recoveryBannerReview").addEventListener("click", () => {
+  const panel = el("recoveryPanel");
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) renderRecoveryPanel();
+});
+
+el("recoveryPanelClose").addEventListener("click", () => {
+  el("recoveryPanel").hidden = true;
+});
+
+el("recoveryResolveAllBtn").addEventListener("click", async (e) => {
+  e.target.disabled = true;
+  try {
+    const resp = await fetch("/api/recovery/resolve_all", { method: "POST" });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Couldn't resolve items.");
+    showToast(`Marked ${data.resolved} item${data.resolved === 1 ? "" : "s"} resolved.`);
+    await checkRecoveryNotices();
+  } catch (err) {
+    showToast(err.message, true);
+  } finally {
+    e.target.disabled = false;
+  }
+});
+
 el("recoveryBannerDismiss").addEventListener("click", () => {
   el("recoveryBanner").hidden = true;
+  el("recoveryPanel").hidden = true;
 });
 
 checkRecoveryNotices();

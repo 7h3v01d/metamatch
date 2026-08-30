@@ -173,6 +173,64 @@ def _unb64_or_none(data: Optional[str]) -> Optional[bytes]:
 # than treated as a structural failure.
 # --------------------------------------------------------------------------
 
+def _journal_unavailable_result(base: dict, exc: Exception) -> dict:
+    """A clean, no-mutation error result for when a journal write fails at or
+    before mark_applying - i.e. before any file was touched. The operation is
+    aborted and nothing on disk changed, which is exactly what we want when
+    the journal (our source of truth for undo/recovery) can't be written."""
+    r = dict(base)
+    r["error"] = (
+        f"Couldn't record this operation in MetaMatch's journal ({exc}); "
+        "no changes were made to the file, to stay safe."
+    )
+    return r
+
+
+def _safe_commit(journal, txn_id: int, new_path: str, result: dict, after_state=None) -> bool:
+    """Commit the transaction after a successful on-disk apply. If the journal
+    write itself fails (e.g. the disk filled between mutating the file and
+    recording it), the file is already correctly updated - so we do NOT treat
+    this as an apply failure or roll anything back. Instead we surface it: the
+    change stands on disk, but it can't be undone from here and the row stays
+    non-terminal, so a restart's recovery pass will flag it for a check.
+    Returns True on a clean commit, False if the journal couldn't record it."""
+    try:
+        journal.commit(txn_id, new_path, after_state=after_state)
+        return True
+    except Exception as e:
+        result["journal_error"] = str(e)
+        result["can_undo"] = False
+        result.setdefault("warnings", []).append(
+            "The change was written to disk, but MetaMatch couldn't record it in its "
+            f"journal ({e}). The file is correctly updated; however this change can't be "
+            "undone from within MetaMatch, and it may be flagged for a check after a restart."
+        )
+        return False
+
+
+def _mark_rolling_back_safely(journal, txn_id: int) -> None:
+    """Best-effort status marker before compensation. A failure to write it
+    must not stop the actual file rollback from running."""
+    try:
+        journal.mark_rolling_back(txn_id)
+    except Exception:
+        pass
+
+
+def _finalize_failed_apply_safely(journal, txn_id: int, result: dict, restored_ok: bool, warnings: list) -> None:
+    """Record a failed apply's rollback outcome, tolerating a journal write
+    failure. The file-level compensation has already run by this point; if the
+    journal can't record the result, the row is simply left non-terminal so a
+    restart escalates it to RECOVERY_REQUIRED - never a crash."""
+    try:
+        _finalize_failed_apply(journal, txn_id, result, restored_ok, warnings)
+    except Exception as e:
+        if warnings:
+            result.setdefault("warnings", []).extend(warnings)
+        result["recovery_required"] = True
+        result["journal_error"] = str(e)
+
+
 def _finalize_failed_apply(journal, txn_id: int, result: dict, restored_ok: bool, warnings: list) -> None:
     """Records the outcome of a rollback on both the journal row and the
     result dict the caller returns, so the app/tests can see what happened
@@ -553,7 +611,12 @@ class MusicLibrary:
         pre_apply_art = tagger_module.read_cover_art(track.path) if do_art else None
 
         operation = {"do_tag": do_tag, "do_rename": do_rename, "do_art": do_art}
-        txn_id = self.journal.begin("music", true_original_path, track.path, before_state, operation)
+        _base = {"original_path": track.path, "new_path": track.path,
+                 "tagged": False, "renamed": False, "art_embedded": False, "error": None}
+        try:
+            txn_id = self.journal.begin("music", true_original_path, track.path, before_state, operation)
+        except Exception as e:
+            return _journal_unavailable_result(_base, e)
 
         art_bytes = art_mime = None
         if do_art and track.match and track.match.get("release_id"):
@@ -563,7 +626,10 @@ class MusicLibrary:
 
         # Past this point files are actually mutated - mark 'applying' so a
         # crash mid-mutation is recoverable as such (vs a benign 'pending').
-        self.journal.mark_applying(txn_id)
+        try:
+            self.journal.mark_applying(txn_id)
+        except Exception as e:
+            return _journal_unavailable_result(_base, e)
         result = tagger_module.apply_match(
             track.path, track.match, do_tag=do_tag, do_rename=do_rename,
             do_art=do_art, art_bytes=art_bytes, art_mime=art_mime,
@@ -573,9 +639,9 @@ class MusicLibrary:
         result["recovery_required"] = False
 
         if result["error"]:
-            self.journal.mark_rolling_back(txn_id)
+            _mark_rolling_back_safely(self.journal, txn_id)
             restored_ok, warnings = _rollback_music_apply(track.path, pre_apply_tags, pre_apply_art, result)
-            _finalize_failed_apply(self.journal, txn_id, result, restored_ok, warnings)
+            _finalize_failed_apply_safely(self.journal, txn_id, result, restored_ok, warnings)
         else:
             after_state = None
             media_fp = _file_fingerprint(result["new_path"])
@@ -584,9 +650,12 @@ class MusicLibrary:
                     "media_size": media_fp["size"], "media_mtime_ns": media_fp["mtime_ns"],
                     "media_hash": media_fp["hash"],
                 }
-            self.journal.commit(txn_id, result["new_path"], after_state=after_state)
-            if existing:
-                self.journal.mark_superseded(existing.id)
+            committed = _safe_commit(self.journal, txn_id, result["new_path"], result, after_state=after_state)
+            if committed and existing:
+                try:
+                    self.journal.mark_superseded(existing.id)
+                except Exception:
+                    pass
 
             with self._lock:
                 if track.path in self.tracks:
@@ -910,9 +979,17 @@ class MovieLibrary:
         pre_apply = self._snapshot_original(video)
 
         operation = {"do_tag": do_tag, "do_rename": do_rename, "do_nfo": do_nfo, "do_poster": do_poster}
-        txn_id = self.journal.begin("movie", true_original_path, video.path, snapshot, operation)
+        _base = {"original_path": video.path, "new_path": video.path,
+                 "tagged": False, "renamed": False, "nfo_path": None, "poster_path": None, "error": None}
+        try:
+            txn_id = self.journal.begin("movie", true_original_path, video.path, snapshot, operation)
+        except Exception as e:
+            return _journal_unavailable_result(_base, e)
 
-        self.journal.mark_applying(txn_id)
+        try:
+            self.journal.mark_applying(txn_id)
+        except Exception as e:
+            return _journal_unavailable_result(_base, e)
         result = movie_tagger_module.apply_movie_match(
             video.path, video.match, do_tag=do_tag, do_rename=do_rename, do_nfo=do_nfo, do_poster=do_poster,
         )
@@ -921,9 +998,9 @@ class MovieLibrary:
         result["recovery_required"] = False
 
         if result["error"]:
-            self.journal.mark_rolling_back(txn_id)
+            _mark_rolling_back_safely(self.journal, txn_id)
             restored_ok, warnings = _rollback_movie_apply(video.path, pre_apply, result)
-            _finalize_failed_apply(self.journal, txn_id, result, restored_ok, warnings)
+            _finalize_failed_apply_safely(self.journal, txn_id, result, restored_ok, warnings)
         else:
             # Record the EXACT sidecar paths this apply actually produced,
             # not a path undo could reconstruct later - a rename-time name
@@ -950,9 +1027,12 @@ class MovieLibrary:
                 after_state["poster_mtime_ns"] = poster_fp["mtime_ns"]
                 after_state["poster_hash"] = poster_fp["hash"]
 
-            self.journal.commit(txn_id, result["new_path"], after_state=after_state)
-            if existing:
-                self.journal.mark_superseded(existing.id)
+            committed = _safe_commit(self.journal, txn_id, result["new_path"], result, after_state=after_state)
+            if committed and existing:
+                try:
+                    self.journal.mark_superseded(existing.id)
+                except Exception:
+                    pass
 
             with self._lock:
                 if video.path in self.videos:
@@ -1407,9 +1487,17 @@ class TvLibrary:
         pre_apply = self._snapshot_original(episode)
 
         operation = {"do_tag": do_tag, "do_rename": do_rename, "do_nfo": do_nfo, "do_thumb": do_thumb}
-        txn_id = self.journal.begin("tv", true_original_path, episode.path, snapshot, operation)
+        _base = {"original_path": episode.path, "new_path": episode.path,
+                 "tagged": False, "renamed": False, "nfo_path": None, "thumb_path": None, "error": None}
+        try:
+            txn_id = self.journal.begin("tv", true_original_path, episode.path, snapshot, operation)
+        except Exception as e:
+            return _journal_unavailable_result(_base, e)
 
-        self.journal.mark_applying(txn_id)
+        try:
+            self.journal.mark_applying(txn_id)
+        except Exception as e:
+            return _journal_unavailable_result(_base, e)
         result = tv_tagger_module.apply_episode_match(
             episode.path, episode.match, do_tag=do_tag, do_rename=do_rename, do_nfo=do_nfo, do_thumb=do_thumb,
         )
@@ -1418,9 +1506,9 @@ class TvLibrary:
         result["recovery_required"] = False
 
         if result["error"]:
-            self.journal.mark_rolling_back(txn_id)
+            _mark_rolling_back_safely(self.journal, txn_id)
             restored_ok, warnings = _rollback_tv_apply(episode.path, pre_apply, result)
-            _finalize_failed_apply(self.journal, txn_id, result, restored_ok, warnings)
+            _finalize_failed_apply_safely(self.journal, txn_id, result, restored_ok, warnings)
         else:
             after_state = {"nfo_path": result.get("nfo_path"), "thumb_path": result.get("thumb_path")}
             media_fp = _file_fingerprint(result["new_path"])
@@ -1439,9 +1527,12 @@ class TvLibrary:
                 after_state["thumb_mtime_ns"] = thumb_fp["mtime_ns"]
                 after_state["thumb_hash"] = thumb_fp["hash"]
 
-            self.journal.commit(txn_id, result["new_path"], after_state=after_state)
-            if existing:
-                self.journal.mark_superseded(existing.id)
+            committed = _safe_commit(self.journal, txn_id, result["new_path"], result, after_state=after_state)
+            if committed and existing:
+                try:
+                    self.journal.mark_superseded(existing.id)
+                except Exception:
+                    pass
 
             with self._lock:
                 if episode.path in self.episodes:
@@ -1732,9 +1823,17 @@ class TvLibrary:
         before_state = {"artifacts": snapshot_artifacts}
         operation = {"type": "series_metadata", "series_root": series_root, "seasons": list(seasons)}
 
-        txn_id = self.journal.begin("tv_series", nfo_path, nfo_path, before_state, operation)
-        result["txn_id"] = txn_id
-        self.journal.mark_applying(txn_id)
+        txn_id = None
+        try:
+            txn_id = self.journal.begin("tv_series", nfo_path, nfo_path, before_state, operation)
+            result["txn_id"] = txn_id
+            self.journal.mark_applying(txn_id)
+        except Exception as e:
+            result["error"] = (
+                f"Couldn't record this operation in MetaMatch's journal ({e}); "
+                "no series files were written, to stay safe."
+            )
+            return result
 
         written = []
         try:
@@ -1762,9 +1861,9 @@ class TvLibrary:
             self.journal.commit(txn_id, nfo_path, after_state=after)
         except Exception as e:
             result["error"] = str(e)
-            self.journal.mark_rolling_back(txn_id)
+            _mark_rolling_back_safely(self.journal, txn_id)
             restored_ok, warns = _revert_series_artifacts(snapshot_artifacts)
-            _finalize_failed_apply(self.journal, txn_id, result, restored_ok, warns)
+            _finalize_failed_apply_safely(self.journal, txn_id, result, restored_ok, warns)
 
         return result
 

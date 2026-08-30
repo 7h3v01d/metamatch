@@ -284,9 +284,11 @@ class TestDbLockContention:
         self, music_dir, mock_music_match, monkeypatch
     ):
         """The nastier case: the file mutations and rename SUCCEED, then the
-        journal is locked exactly at the commit. The apply raises, the row is
-        left APPLYING, and a restart must escalate it to RECOVERY_REQUIRED so
-        the (now-renamed) file isn't silently forgotten."""
+        journal is locked exactly at the commit. The apply must NOT crash - the
+        file is already correctly written, so it returns gracefully flagged as
+        applied-but-not-recorded (no undo), the row is left mid-apply, and a
+        restart escalates it to RECOVERY_REQUIRED so the file isn't silently
+        forgotten."""
         from metamatch import MusicLibrary
 
         lib = MusicLibrary()
@@ -299,8 +301,12 @@ class TestDbLockContention:
             raise sqlite3.OperationalError("database is locked")
         monkeypatch.setattr(lib.journal, "commit", locked_commit)
 
-        with pytest.raises(sqlite3.OperationalError):
-            lib.apply(target["id"], do_tag=True, do_rename=True, do_art=False)
+        # No exception: the on-disk apply stands, the journal failure is surfaced.
+        result = lib.apply(target["id"], do_tag=True, do_rename=True, do_art=False)
+        assert not result["error"]                 # the apply itself succeeded on disk
+        assert result.get("journal_error")         # but the journal couldn't record it
+        assert result.get("can_undo") is False
+        assert result.get("warnings")
 
         # the row is stranded mid-apply until a restart runs recovery
         assert lib.journal.find_in_progress("music")  # still APPLYING
@@ -550,3 +556,125 @@ class TestRecoveryEndpointEnrichment:
         data = app_client.get("/api/recovery").get_json()
         serious = [n for n in data["music"] if n["severity"] == "attention"]
         assert serious and all(n["message"] for n in serious)
+
+
+# ---------------------------------------------------------------------------
+# Journal-write failures. The journal is the source of truth for undo and
+# recovery; a write to IT failing (disk full at the exact moment we record a
+# transaction) must never crash and must leave a coherent state. These inject
+# ENOSPC into the journal methods themselves at each boundary.
+# ---------------------------------------------------------------------------
+
+class TestJournalWriteFailures:
+    @requires_ffmpeg
+    def test_begin_failure_touches_nothing(self, music_dir, mock_music_match, monkeypatch):
+        """Journal write fails at begin() - before any mutation. The apply
+        must abort cleanly with the file byte-for-byte unchanged."""
+        from metamatch import MusicLibrary
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        lib.match()
+        target = _untagged_track(lib)
+        before_hash = _sha256(target["path"])
+
+        monkeypatch.setattr(lib.journal, "begin", _enospc)
+        result = lib.apply(target["id"], do_tag=True, do_rename=True, do_art=False)
+
+        assert result["error"] and "journal" in result["error"].lower()
+        assert _sha256(target["path"]) == before_hash   # nothing touched
+        assert os.path.exists(target["path"])            # not renamed
+
+    @requires_ffmpeg
+    def test_mark_applying_failure_touches_nothing(self, music_dir, mock_music_match, monkeypatch):
+        """Journal write fails at mark_applying() - still before mutation."""
+        from metamatch import MusicLibrary
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        lib.match()
+        target = _untagged_track(lib)
+        before_hash = _sha256(target["path"])
+
+        monkeypatch.setattr(lib.journal, "mark_applying", _enospc)
+        result = lib.apply(target["id"], do_tag=True, do_rename=True, do_art=False)
+
+        assert result["error"] and "journal" in result["error"].lower()
+        assert _sha256(target["path"]) == before_hash
+        assert not lib.journal.list_undoable("music")   # no committed txn
+
+    @requires_ffmpeg
+    def test_commit_failure_keeps_applied_file_but_flags_it(self, music_dir, mock_music_match, monkeypatch):
+        """Journal write fails at commit() - AFTER a successful apply. The file
+        change stands (no false rollback), but it's flagged: not undoable, and
+        surfaced as needing a check on restart."""
+        from metamatch import MusicLibrary
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        lib.match()
+        target = _untagged_track(lib)
+        journal_path = lib.journal.path
+
+        monkeypatch.setattr(lib.journal, "commit", _enospc)
+        result = lib.apply(target["id"], do_tag=True, do_rename=True, do_art=False)
+
+        assert not result["error"]              # the on-disk apply succeeded
+        assert result.get("journal_error")      # journal couldn't record it
+        assert result.get("can_undo") is False
+        # tags really were written (apply wasn't rolled back)
+        assert _has_id3(result["new_path"])
+        # and a restart flags it for a check
+        restarted = MusicLibrary(journal=Journal(journal_path))
+        assert any(n["status"] == RECOVERY_REQUIRED for n in restarted.get_recovery_notices())
+
+    @requires_ffmpeg
+    def test_journal_failure_during_rollback_does_not_crash(self, music_dir, mock_music_match, monkeypatch):
+        """A real apply failure triggers rollback; if the journal write that
+        records the rollback outcome ALSO fails, the file compensation still
+        runs and the result is flagged recovery_required rather than crashing."""
+        from metamatch import MusicLibrary
+        import metamatch.tagger as tagger_module
+
+        lib = MusicLibrary()
+        lib.scan(str(music_dir))
+        lib.match()
+        target = _untagged_track(lib)
+
+        # Force the apply to fail (so rollback runs)...
+        monkeypatch.setattr(tagger_module, "rename_to_match", lambda p, m: (_ for _ in ()).throw(OSError("boom")))
+        # ...and force the journal write that records the rollback to fail too.
+        monkeypatch.setattr(lib.journal, "mark_rolled_back", _enospc)
+        monkeypatch.setattr(lib.journal, "mark_recovery_required", _enospc)
+
+        result = lib.apply(target["id"], do_tag=True, do_rename=True, do_art=False)
+        assert result["error"]                       # the original apply error
+        assert result.get("recovery_required") is True
+        assert result.get("journal_error")
+        # the file compensation still ran: tags rolled back to empty
+        assert not _has_id3(target["path"])
+
+    @requires_ffmpeg
+    def test_movie_commit_failure_is_graceful(self, movie_dir, mock_movie_match, monkeypatch):
+        from metamatch import MovieLibrary
+        lib = MovieLibrary()
+        lib.scan(str(movie_dir))
+        lib.match()
+        target = [v for v in lib.videos_payload() if v["filename"].endswith(".mp4")][0]
+
+        monkeypatch.setattr(lib.journal, "commit", _enospc)
+        result = lib.apply(target["id"], do_tag=True, do_rename=True, do_nfo=False, do_poster=False)
+        assert not result["error"]
+        assert result.get("journal_error")
+        assert result.get("can_undo") is False
+
+    @requires_ffmpeg
+    def test_tv_commit_failure_is_graceful(self, tv_dir, mock_tv_match, mock_thumb_download, monkeypatch):
+        from metamatch import TvLibrary
+        lib = TvLibrary()
+        lib.scan(str(tv_dir))
+        lib.match()
+        target = [e for e in lib.episodes_payload() if e["filename"].endswith(".mp4")][0]
+
+        monkeypatch.setattr(lib.journal, "commit", _enospc)
+        result = lib.apply(target["id"], do_tag=True, do_rename=True, do_nfo=True, do_thumb=True)
+        assert not result["error"]
+        assert result.get("journal_error")
+        assert result.get("can_undo") is False

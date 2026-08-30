@@ -83,6 +83,7 @@ ROLLED_BACK = "rolled_back"
 RECOVERY_REQUIRED = "recovery_required"  # apply failed AND rollback couldn't fully restore before-state
 SUPERSEDED = "superseded"     # replaced by a later transaction on the same lineage before it was undone
 INTERRUPTED = "interrupted"   # was "pending" when the process restarted - a crash-recovery finding
+RESOLVED = "resolved"         # a RECOVERY_REQUIRED item the user has acknowledged/handled by hand - terminal, no longer surfaced
 
 
 @dataclass
@@ -220,6 +221,35 @@ class Journal:
                 "UPDATE transactions SET status=?, rollback_info=? WHERE id=?",
                 (RECOVERY_REQUIRED, json.dumps(info), txn_id),
             )
+
+    def mark_resolved(self, txn_id: int, note: Optional[str] = None) -> bool:
+        """Acknowledge a RECOVERY_REQUIRED item as handled by the user: move
+        it to the terminal RESOLVED state so it stops surfacing in the
+        needs-attention list on every restart. Only a RECOVERY_REQUIRED row
+        can be resolved (you can't 'resolve' a healthy or in-progress
+        transaction); returns True if it was transitioned, False otherwise.
+        The prior rollback_info is preserved for history, with the
+        acknowledgement recorded alongside it."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT status, rollback_info FROM transactions WHERE id=?", (txn_id,)
+            ).fetchone()
+            if row is None or row["status"] != RECOVERY_REQUIRED:
+                return False
+            try:
+                info = json.loads(row["rollback_info"]) if row["rollback_info"] else {}
+                if not isinstance(info, dict):
+                    info = {"previous": info}
+            except (json.JSONDecodeError, TypeError):
+                info = {}
+            info["resolved"] = True
+            if note:
+                info["resolved_note"] = note
+            conn.execute(
+                "UPDATE transactions SET status=?, rollback_info=? WHERE id=?",
+                (RESOLVED, json.dumps(info), txn_id),
+            )
+            return True
 
     def mark_superseded(self, txn_id: int) -> None:
         with self._lock, self._connect() as conn:

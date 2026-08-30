@@ -222,6 +222,36 @@ def api_recovery():
     })
 
 
+@app.route("/api/recovery/resolve", methods=["POST"])
+def api_recovery_resolve():
+    """Acknowledge a single RECOVERY_REQUIRED item as handled by hand, so it
+    stops resurfacing. The three libraries share one journal, so resolving by
+    transaction id is global - any library's journal handle works."""
+    data = request.get_json(force=True) or {}
+    txn_id = data.get("txn_id")
+    if txn_id is None:
+        return jsonify({"error": "No txn_id provided."}), 400
+    try:
+        ok = music_library.journal.mark_resolved(int(txn_id), note=data.get("note"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "txn_id must be an integer."}), 400
+    if not ok:
+        return jsonify({"error": "That item isn't awaiting recovery (already resolved, or not found)."}), 409
+    return jsonify({"resolved": True, "txn_id": int(txn_id)})
+
+
+@app.route("/api/recovery/resolve_all", methods=["POST"])
+def api_recovery_resolve_all():
+    """Acknowledge every outstanding RECOVERY_REQUIRED item at once."""
+    journal = music_library.journal
+    resolved = 0
+    for kind in ("music", "movie", "tv", "tv_series"):
+        for txn in journal.list_by_status(kind, RECOVERY_REQUIRED):
+            if journal.mark_resolved(txn.id):
+                resolved += 1
+    return jsonify({"resolved": resolved})
+
+
 # ---------------------------------------------------------------------------
 # Music
 # ---------------------------------------------------------------------------
