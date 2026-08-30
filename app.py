@@ -50,7 +50,7 @@ import os
 
 from flask import Flask, jsonify, request, render_template, send_file, Response
 
-from metamatch import MusicLibrary, MovieLibrary
+from metamatch import MusicLibrary, MovieLibrary, TvLibrary
 from metamatch.art import fetch_cover_art
 from metamatch.movie_matcher import TmdbNotConfigured
 from metamatch import config as app_config
@@ -62,6 +62,7 @@ app = Flask(__name__)
 # multi-user host would want one pair of these per user/session instead.
 music_library = MusicLibrary()
 movie_library = MovieLibrary(journal=music_library.journal)  # one shared journal file for both
+tv_library = TvLibrary(journal=music_library.journal)        # same shared journal (kind "tv")
 
 
 @app.before_request
@@ -199,16 +200,19 @@ def api_recovery():
     """
     music_notices = _enrich_notices(music_library.get_recovery_notices())
     movie_notices = _enrich_notices(movie_library.get_recovery_notices())
+    tv_notices = _enrich_notices(tv_library.get_recovery_notices())
 
     attention = (
         [{**n, "kind": "music"} for n in music_library.get_outstanding_recovery()] +
-        [{**n, "kind": "movie"} for n in movie_library.get_outstanding_recovery()]
+        [{**n, "kind": "movie"} for n in movie_library.get_outstanding_recovery()] +
+        [{**n, "kind": "tv"} for n in tv_library.get_outstanding_recovery()]
     )
-    interrupted = sum(1 for n in (music_notices + movie_notices) if n["severity"] == "info")
+    interrupted = sum(1 for n in (music_notices + movie_notices + tv_notices) if n["severity"] == "info")
 
     return jsonify({
         "music": music_notices,
         "movies": movie_notices,
+        "tv": tv_notices,
         "needs_attention": attention,
         "summary": {
             "interrupted": interrupted,
@@ -491,6 +495,148 @@ def api_movies_export_csv():
     mem = io.BytesIO(csv_text.encode("utf-8"))
     mem.seek(0)
     return send_file(mem, mimetype="text/csv", as_attachment=True, download_name="metamatch_movies_report.csv")
+
+
+# --------------------------------------------------------------------- TV
+# The episode analogue of the movie routes above. Same shapes, backed by
+# tv_library (journal kind "tv"); episodes carry series/season/episode and
+# .nfo/-thumb.jpg sidecars instead of a movie title/poster.
+
+@app.route("/api/tv/scan", methods=["POST"])
+def api_tv_scan():
+    data = request.get_json(force=True) or {}
+    folder = (data.get("folder") or "").strip()
+    recursive = bool(data.get("recursive", True))
+    if not folder:
+        return jsonify({"error": "No folder provided."}), 400
+    try:
+        episodes = tv_library.scan(folder, recursive=recursive)
+    except NotADirectoryError:
+        return jsonify({"error": f"'{folder}' is not a folder that exists on this machine."}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({
+        "folder": folder, "count": len(episodes), "episodes": episodes,
+        "ffprobe_available": tv_library.ffprobe_available,
+    })
+
+
+@app.route("/api/tv/match/start", methods=["POST"])
+def api_tv_match_start():
+    try:
+        tv_library.match_async()
+    except TmdbNotConfigured as e:
+        return jsonify({"error": str(e)}), 400
+    except (ValueError, RuntimeError) as e:
+        status = 409 if isinstance(e, RuntimeError) else 400
+        return jsonify({"error": str(e)}), status
+    return jsonify({"started": True})
+
+
+@app.route("/api/tv/match/progress")
+def api_tv_match_progress():
+    return jsonify(tv_library.match_progress_snapshot())
+
+
+@app.route("/api/tv")
+def api_tv_list():
+    return jsonify({"folder": tv_library.folder, "episodes": tv_library.episodes_payload()})
+
+
+@app.route("/api/tv/apply", methods=["POST"])
+def api_tv_apply():
+    data = request.get_json(force=True) or {}
+    try:
+        result = tv_library.apply(
+            data.get("id"),
+            do_tag=bool(data.get("tag", False)),
+            do_rename=bool(data.get("rename", True)),
+            do_nfo=bool(data.get("nfo", True)),
+            do_thumb=bool(data.get("thumb", True)),
+        )
+    except KeyError:
+        return jsonify({"error": "Unknown file."}), 404
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@app.route("/api/tv/apply_all", methods=["POST"])
+def api_tv_apply_all():
+    data = request.get_json(force=True) or {}
+    try:
+        result = tv_library.apply_all(
+            do_tag=bool(data.get("tag", False)),
+            do_rename=bool(data.get("rename", True)),
+            do_nfo=bool(data.get("nfo", True)),
+            do_thumb=bool(data.get("thumb", True)),
+            min_confidence=float(data.get("min_confidence", 75)),
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@app.route("/api/tv/undo", methods=["POST"])
+def api_tv_undo():
+    data = request.get_json(force=True) or {}
+    try:
+        result = tv_library.undo(data.get("id"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if result["error"]:
+        return jsonify(result), 500
+    return jsonify(result)
+
+
+@app.route("/api/tv/undo_all", methods=["POST"])
+def api_tv_undo_all():
+    return jsonify(tv_library.undo_all())
+
+
+@app.route("/api/tv/duplicates/scan", methods=["POST"])
+def api_tv_duplicates_scan():
+    try:
+        return jsonify(tv_library.find_duplicates())
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/tv/duplicates/quarantine", methods=["POST"])
+def api_tv_duplicates_quarantine():
+    data = request.get_json(force=True) or {}
+    try:
+        result = tv_library.quarantine(data.get("paths") or [])
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@app.route("/api/tv/export_csv")
+def api_tv_export_csv():
+    csv_text = tv_library.export_csv()
+    mem = io.BytesIO(csv_text.encode("utf-8"))
+    mem.seek(0)
+    return send_file(mem, mimetype="text/csv", as_attachment=True, download_name="metamatch_tv_report.csv")
+
+
+@app.route("/api/tv/series_metadata", methods=["POST"])
+def api_tv_series_metadata():
+    data = request.get_json(force=True) or {}
+    try:
+        result = tv_library.write_series_metadata(
+            min_confidence=float(data.get("min_confidence", 75)),
+            do_poster=bool(data.get("poster", True)),
+            do_season_posters=bool(data.get("season_posters", True)),
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@app.route("/api/tv/series_metadata/undo", methods=["POST"])
+def api_tv_series_metadata_undo():
+    return jsonify(tv_library.undo_series_metadata_all())
 
 
 if __name__ == "__main__":

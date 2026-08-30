@@ -251,13 +251,16 @@ def mock_poster_download(monkeypatch):
 @pytest.fixture
 def app_client(isolated_config, isolated_journal, monkeypatch):
     import app as app_module
-    from metamatch import MusicLibrary, MovieLibrary
+    from metamatch import MusicLibrary, MovieLibrary, TvLibrary
 
     # Swap in fresh library instances so tests never see state left over
     # from a previous test (mirrors what a host app gets by simply
-    # instantiating its own MusicLibrary()/MovieLibrary() per session).
-    monkeypatch.setattr(app_module, "music_library", MusicLibrary())
-    monkeypatch.setattr(app_module, "movie_library", MovieLibrary())
+    # instantiating its own libraries per session). Movie and TV share the
+    # music journal, exactly as app.py wires them in production.
+    fresh_music = MusicLibrary()
+    monkeypatch.setattr(app_module, "music_library", fresh_music)
+    monkeypatch.setattr(app_module, "movie_library", MovieLibrary(journal=fresh_music.journal))
+    monkeypatch.setattr(app_module, "tv_library", TvLibrary(journal=fresh_music.journal))
 
     app_module.app.config.update(TESTING=True)
     return app_module.app.test_client()
@@ -279,3 +282,118 @@ def wait_for_progress():
         raise TimeoutError(f"Timed out waiting for {url} to finish: {progress}")
 
     return _wait
+
+
+# ---------------------------------------------------------------------------
+# TV fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def tv_dir(tmp_path, media_fixtures_dir):
+    """A folder of episode files: an mkv (ffmpeg-remux path) inside a
+    'Season 01' subfolder, and an mp4 (direct-atom path) named flat."""
+    dest = tmp_path / "tv"
+    dest.mkdir()
+    if FFMPEG_AVAILABLE:
+        season = dest / "Test Show" / "Season 01"
+        season.mkdir(parents=True)
+        shutil.copy(
+            media_fixtures_dir / "Test.Movie.2020.1080p.BluRay.x264-GROUP.mkv",
+            season / "Test.Show.S01E02.The.Test.720p.WEB-DL.mkv",
+        )
+        shutil.copy(media_fixtures_dir / "sample_movie.mp4", dest / "Another.Show.S02E05.mp4")
+    return dest
+
+
+def make_fake_tv_match(**overrides) -> dict:
+    base = {
+        "type": "tv",
+        "series_tmdb_id": 1396,
+        "series_name": "Breaking Bad",
+        "series_year": "2008",
+        "season": 1,
+        "episode": 2,
+        "episodes": [2],
+        "episode_title": "Cat's in the Bag...",
+        "episode_overview": "Walt and Jesse try to dispose of the bodies.",
+        "air_date": "2008-01-27",
+        "vote_average": 8.5,
+        "still_path": "/still.jpg",
+        "still_url": "https://image.tmdb.org/t/p/w300/still.jpg",
+        "still_url_full": "https://image.tmdb.org/t/p/original/still.jpg",
+        "name_similarity": 95.0,
+        "confidence": 96.0,
+        "tmdb_url": "https://www.themoviedb.org/tv/1396/season/1/episode/2",
+    }
+    base.update(overrides)
+    return base
+
+
+@pytest.fixture
+def mock_tv_match(monkeypatch):
+    """Patches TMDB TV lookups at the source (tv_matcher.find_best_match),
+    honouring the file's own parsed season/episode so multi-file folders get
+    correct per-episode matches."""
+    import metamatch.tv_matcher as tv_matcher_module
+
+    def fake_find_best_match(ep_file):
+        if not ep_file.parsed:
+            return None
+        return make_fake_tv_match(
+            season=ep_file.season, episode=ep_file.episode,
+            episodes=ep_file.episodes or [ep_file.episode],
+        )
+
+    monkeypatch.setattr(tv_matcher_module, "find_best_match", fake_find_best_match)
+    return fake_find_best_match
+
+
+@pytest.fixture
+def mock_thumb_download(monkeypatch):
+    """Patches episode-thumbnail downloads (writes a fake jpg instead of hitting TMDB's CDN)."""
+    import metamatch.tv_tagger as tv_tagger_module
+    fake_bytes = b"FAKETHUMBNAILBYTES"
+
+    def fake_download(path, match):
+        dest = os.path.splitext(path)[0] + tv_tagger_module.THUMB_SUFFIX
+        with open(dest, "wb") as f:
+            f.write(fake_bytes)
+        return dest
+
+    monkeypatch.setattr(tv_tagger_module, "download_thumb", fake_download)
+    return fake_bytes
+
+
+@pytest.fixture
+def mock_tv_series_details(monkeypatch):
+    """Patches TMDB series/season detail lookups and image downloads so
+    series-metadata tests never touch the network."""
+    import metamatch.tv_matcher as tv_matcher_module
+    import metamatch.tv_tagger as tv_tagger_module
+
+    def fake_series_details(series_id):
+        return {
+            "series_tmdb_id": series_id,
+            "name": "Breaking Bad",
+            "overview": "A chemistry teacher turns to cooking meth.",
+            "first_air_date": "2008-01-20",
+            "year": "2008",
+            "genres": ["Drama", "Crime"],
+            "vote_average": 8.9,
+            "status": "Ended",
+            "poster_path": "/series_poster.jpg",
+            "poster_url_full": "https://image.tmdb.org/t/p/original/series_poster.jpg",
+        }
+
+    def fake_season_poster(series_id, season):
+        return f"https://image.tmdb.org/t/p/original/season{season}.jpg"
+
+    def fake_download(url, dest):
+        with open(dest, "wb") as f:
+            f.write(b"FAKEIMAGEBYTES:" + url.encode())
+        return dest
+
+    monkeypatch.setattr(tv_matcher_module, "fetch_series_details", fake_series_details)
+    monkeypatch.setattr(tv_matcher_module, "fetch_season_poster_url", fake_season_poster)
+    monkeypatch.setattr(tv_tagger_module, "download_image", fake_download)
+    return fake_series_details

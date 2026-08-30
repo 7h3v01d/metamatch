@@ -42,6 +42,9 @@ from . import dedup as dedup_module
 from . import video_scanner as video_scanner_module
 from . import movie_matcher as movie_matcher_module
 from . import movie_tagger as movie_tagger_module
+from . import episode_scanner as episode_scanner_module
+from . import tv_matcher as tv_matcher_module
+from . import tv_tagger as tv_tagger_module
 from . import config as config_module
 from . import journal as journal_module
 from . import fingerprint as fingerprint_module
@@ -264,6 +267,112 @@ def _rollback_movie_apply(path: str, pre_apply: dict, result: dict) -> "tuple[bo
             else:
                 # It existed before and we overwrote it - restore its bytes
                 # if we snapshotted them, else leave it and say so.
+                original = _unb64_or_none(pre_apply.get(bytes_key))
+                if original is not None:
+                    with open(created, "wb") as f:
+                        f.write(original)
+                else:
+                    warnings.append(
+                        f"Original {label} couldn't be snapshotted before apply; "
+                        "left as MetaMatch wrote it."
+                    )
+        except OSError as e:
+            fully_restored = False
+            warnings.append(f"Could not restore {label} '{os.path.basename(created)}': {e}")
+
+    return fully_restored, warnings
+
+
+def _revert_series_artifacts(snapshot_artifacts: dict, fingerprints: dict | None = None) -> "tuple[bool, list]":
+    """Revert a set of series-level sidecar writes (tvshow.nfo, series/season
+    posters) to their pre-write state: delete the ones we created, restore the
+    bytes of any we overwrote. Shared by the write-time rollback (on a failed
+    write) and user-initiated undo. When `fingerprints` is given (undo), an
+    artifact the user has changed since we wrote it is left alone and flagged,
+    rather than clobbered. The small tvshow.nfo is always snapshotted so its
+    restore is structural (failure -> not fully restored); posters may exceed
+    the snapshot cap, in which case an overwrite we can't reverse is a warning
+    only, matching how movie/episode art is treated."""
+    warnings: list = []
+    fully_restored = True
+
+    for abspath, snap in snapshot_artifacts.items():
+        try:
+            exists_now = os.path.exists(abspath)
+            if fingerprints is not None and abspath in fingerprints:
+                fp = fingerprints[abspath]
+                if _fingerprint_changed(abspath, fp.get("size"), fp.get("mtime_ns"), fp.get("hash")):
+                    warnings.append(f"Left '{os.path.basename(abspath)}' alone - it changed since MetaMatch wrote it.")
+                    continue
+
+            if not snap.get("had"):
+                if exists_now:
+                    os.remove(abspath)
+            else:
+                original = _unb64_or_none(snap.get("bytes_b64"))
+                if original is not None:
+                    with open(abspath, "wb") as f:
+                        f.write(original)
+                elif abspath.lower().endswith(".nfo"):
+                    fully_restored = False
+                    warnings.append(f"Couldn't restore original '{os.path.basename(abspath)}' (not snapshotted).")
+                else:
+                    warnings.append(f"Couldn't restore original '{os.path.basename(abspath)}' (too large to snapshot); left as written.")
+        except OSError as e:
+            fully_restored = False
+            warnings.append(f"Could not revert '{os.path.basename(abspath)}': {e}")
+
+    return fully_restored, warnings
+
+
+def _rollback_tv_apply(path: str, pre_apply: dict, result: dict) -> "tuple[bool, list]":
+    """Compensate a failed episode apply, in place at `path`. Mirrors
+    _rollback_movie_apply: reverts mp4/m4v atoms and created/overwritten
+    .nfo/-thumb.jpg sidecars; an ffmpeg remux can't be reversed without the
+    original bytes, so it's surfaced as a warning. Returns (fully_restored,
+    warnings). The episode embed writes several atoms (show/season/episode/
+    stik) beyond title/year, so the revert clears that whole set."""
+    warnings: list = []
+    fully_restored = True
+    ext = os.path.splitext(path)[1].lower()
+
+    if result.get("tagged"):
+        if ext in (".mp4", ".m4v"):
+            try:
+                from mutagen.mp4 import MP4
+                audio = MP4(path)
+                if pre_apply.get("tag_title"):
+                    audio["\xa9nam"] = [pre_apply["tag_title"]]
+                elif "\xa9nam" in audio:
+                    del audio["\xa9nam"]
+                if pre_apply.get("tag_year"):
+                    audio["\xa9day"] = [str(pre_apply["tag_year"])]
+                elif "\xa9day" in audio:
+                    del audio["\xa9day"]
+                for atom in ("tvsh", "tvsn", "tves", "stik", "\xa9ART"):
+                    if atom in audio:
+                        del audio[atom]
+                audio.save()
+            except Exception as e:
+                fully_restored = False
+                warnings.append(f"Could not revert embedded metadata on '{os.path.basename(path)}': {e}")
+        else:
+            warnings.append(
+                "Embedded metadata was written via an ffmpeg remux, which can't be "
+                "automatically reverted - the video was left as remuxed."
+            )
+
+    for key, had_key, bytes_key, label in (
+        ("nfo_path", "had_nfo", "nfo_bytes_b64", ".nfo"),
+        ("thumb_path", "had_thumb", "thumb_bytes_b64", "thumbnail"),
+    ):
+        created = result.get(key)
+        if not created or not os.path.exists(created):
+            continue
+        try:
+            if not pre_apply.get(had_key):
+                os.remove(created)
+            else:
                 original = _unb64_or_none(pre_apply.get(bytes_key))
                 if original is not None:
                     with open(created, "wb") as f:
@@ -1097,5 +1206,599 @@ class MovieLibrary:
                 writer.writerow([_csv_safe(val) for val in [
                     v.path, v.tag_title or v.guess_title or "", v.tag_year or v.guess_year or "",
                     m.get("title", ""), m.get("year", ""), m.get("confidence", ""), m.get("tmdb_url", ""),
+                ]])
+        return buf.getvalue()
+
+
+# =====================================================================
+# TvLibrary - the episode analogue of MovieLibrary. Same journal-backed
+# apply/undo/rollback/recovery machinery (journal kind "tv"), same
+# fail-closed guarantees, adapted to the series/season/episode model and
+# the .nfo/-thumb.jpg episode sidecars. See MovieLibrary for the shared
+# rationale behind each step; only the TV-specific differences are
+# commented here.
+# =====================================================================
+
+class TvLibrary:
+    """One scanned folder of TV episode files, its TMDB episode matches, and
+    journal-backed undo history (see journal.py)."""
+
+    def __init__(self, journal: Optional[journal_module.Journal] = None):
+        self.folder: Optional[str] = None
+        self.episodes: dict[str, episode_scanner_module.EpisodeFile] = {}
+        self.order: list[str] = []
+        self.match_progress: dict = {"running": False, "done": 0, "total": 0, "error": None}
+        self._lock = threading.RLock()
+
+        self.journal = journal or journal_module.Journal(journal_module.DEFAULT_JOURNAL_PATH)
+        # Episode applies use kind "tv"; series-level artifacts (tvshow.nfo,
+        # series/season posters) use kind "tv_series" so they never show up
+        # in per-episode undo but still get full crash recovery.
+        self.recovered_transactions = (
+            self.journal.recover("tv") + self.journal.recover("tv_series")
+        )
+        self.swept_orphan_temps: list[str] = []
+
+    def get_recovery_notices(self) -> list[dict]:
+        return [t.to_dict() for t in self.recovered_transactions]
+
+    def get_outstanding_recovery(self) -> list[dict]:
+        """Episode and series transactions still at RECOVERY_REQUIRED -
+        persists across restarts until resolved (see
+        MusicLibrary.get_outstanding_recovery)."""
+        return [
+            t.to_dict() for t in (
+                self.journal.list_by_status("tv", journal_module.RECOVERY_REQUIRED) +
+                self.journal.list_by_status("tv_series", journal_module.RECOVERY_REQUIRED)
+            )
+        ]
+
+    @property
+    def ffprobe_available(self) -> bool:
+        return video_scanner_module.FFPROBE_AVAILABLE
+
+    @property
+    def ffmpeg_available(self) -> bool:
+        return movie_tagger_module.FFMPEG_AVAILABLE
+
+    # ---------------------------------------------------------------- scan
+    def scan(self, folder: str, recursive: bool = True) -> list[dict]:
+        episodes = episode_scanner_module.scan_folder(folder, recursive=recursive)
+        self.swept_orphan_temps = movie_tagger_module.sweep_orphan_remux_temps(folder)
+        with self._lock:
+            self.folder = folder
+            self.episodes = {e.path: e for e in episodes}
+            self.order = [e.path for e in episodes]
+            self.match_progress = {"running": False, "done": 0, "total": len(episodes), "error": None}
+        return self.episodes_payload()
+
+    def episodes_payload(self) -> list[dict]:
+        with self._lock:
+            undoable = self.journal.get_undoable_paths("tv", folder=self.folder)
+            out = []
+            for p in self.order:
+                d = self.episodes[p].to_dict()
+                d["can_undo"] = p in undoable
+                out.append(d)
+            return out
+
+    # ------------------------------------------------------------- match
+    def match(self, progress_callback: ProgressCallback = None) -> None:
+        with self._lock:
+            episodes = [self.episodes[p] for p in self.order]
+            self.match_progress = {"running": True, "done": 0, "total": len(episodes), "error": None}
+
+        def on_progress(done, total):
+            with self._lock:
+                self.match_progress["done"] = done
+                self.match_progress["total"] = total
+            if progress_callback:
+                progress_callback(done, total)
+
+        error_message = None
+        try:
+            tv_matcher_module.match_episodes(episodes, progress_callback=on_progress)
+        except movie_matcher_module.TmdbNotConfigured as e:
+            error_message = str(e)
+        except Exception as e:
+            error_message = f"Matching failed: {e}"
+        finally:
+            with self._lock:
+                self.match_progress["running"] = False
+                self.match_progress["error"] = error_message
+
+    def match_async(self, progress_callback: ProgressCallback = None) -> threading.Thread:
+        if not config_module.get_tmdb_api_key():
+            raise movie_matcher_module.TmdbNotConfigured("Add a TMDB API key first.")
+        with self._lock:
+            if not self.order:
+                raise ValueError("Scan a folder first.")
+            if self.match_progress["running"]:
+                raise RuntimeError("Matching is already running.")
+            self.match_progress = {"running": True, "done": 0, "total": len(self.order), "error": None}
+        thread = threading.Thread(target=self.match, kwargs={"progress_callback": progress_callback}, daemon=True)
+        thread.start()
+        return thread
+
+    def match_progress_snapshot(self) -> dict:
+        with self._lock:
+            return dict(self.match_progress)
+
+    # ----------------------------------------------------------- apply
+    def _read_original_atoms(self, path: str) -> tuple:
+        """The pre-apply title/year embedded in an mp4/m4v, so a rollback can
+        put them back. Non-mp4 containers return (None, None) - their embed
+        goes through a remux that rollback can't reverse anyway."""
+        if os.path.splitext(path)[1].lower() not in (".mp4", ".m4v"):
+            return (None, None)
+        try:
+            from mutagen.mp4 import MP4
+            audio = MP4(path)
+            title = (audio.get("\xa9nam") or [None])[0]
+            day = (audio.get("\xa9day") or [None])[0]
+            year = str(day)[:4] if day else None
+            return (title, year)
+        except Exception:
+            return (None, None)
+
+    def _snapshot_original(self, episode: episode_scanner_module.EpisodeFile) -> dict:
+        base = os.path.splitext(episode.path)[0]
+        nfo_path = base + ".nfo"
+        thumb_path = base + tv_tagger_module.THUMB_SUFFIX
+
+        nfo_bytes = _read_small_file(nfo_path, _MAX_SIDECAR_SNAPSHOT_BYTES)
+        thumb_bytes = _read_small_file(thumb_path, _MAX_SIDECAR_SNAPSHOT_BYTES)
+        tag_title, tag_year = self._read_original_atoms(episode.path)
+
+        return {
+            "tag_title": tag_title,
+            "tag_year": tag_year,
+            "had_nfo": os.path.exists(nfo_path),
+            "nfo_bytes_b64": _b64_or_none(nfo_bytes),
+            "had_thumb": os.path.exists(thumb_path),
+            "thumb_bytes_b64": _b64_or_none(thumb_bytes),
+        }
+
+    def apply(self, episode_id: str, do_tag: bool = False, do_rename: bool = True,
+              do_nfo: bool = True, do_thumb: bool = True) -> dict:
+        with self._lock:
+            episode = self.episodes.get(episode_id)
+        if not episode:
+            raise KeyError(f"Unknown file: {episode_id}")
+        if not episode.match:
+            raise ValueError("This file has no match to apply.")
+        return self._apply_one(episode, do_tag, do_rename, do_nfo, do_thumb)
+
+    def apply_all(self, do_tag: bool = False, do_rename: bool = True, do_nfo: bool = True,
+                  do_thumb: bool = True, min_confidence: float = 75.0) -> dict:
+        min_confidence = _validate_confidence(min_confidence)
+        with self._lock:
+            candidates = [self.episodes[p] for p in self.order]
+
+        results = []
+        for episode in candidates:
+            if not episode.match or episode.match.get("confidence", 0) < min_confidence:
+                continue
+            results.append(self._apply_one(episode, do_tag, do_rename, do_nfo, do_thumb))
+
+        succeeded = sum(1 for r in results if not r["error"])
+        return {
+            "attempted": len(results), "succeeded": succeeded, "failed": len(results) - succeeded,
+            "results": results,
+        }
+
+    def _apply_one(self, episode: episode_scanner_module.EpisodeFile, do_tag: bool, do_rename: bool,
+                   do_nfo: bool, do_thumb: bool) -> dict:
+        if _fingerprint_changed(episode.path, episode.size_bytes, episode.mtime_ns, episode.content_hash):
+            return {
+                "original_path": episode.path, "new_path": episode.path,
+                "tagged": False, "renamed": False, "nfo_path": None, "thumb_path": None,
+                "error": "File changed on disk since it was scanned/matched - rescan before applying.",
+            }
+
+        existing = self.journal.get_active_for_path("tv", episode.path)
+        if existing:
+            true_original_path = existing.original_path
+            snapshot = existing.before_state
+        else:
+            true_original_path = episode.path
+            snapshot = self._snapshot_original(episode)
+
+        pre_apply = self._snapshot_original(episode)
+
+        operation = {"do_tag": do_tag, "do_rename": do_rename, "do_nfo": do_nfo, "do_thumb": do_thumb}
+        txn_id = self.journal.begin("tv", true_original_path, episode.path, snapshot, operation)
+
+        self.journal.mark_applying(txn_id)
+        result = tv_tagger_module.apply_episode_match(
+            episode.path, episode.match, do_tag=do_tag, do_rename=do_rename, do_nfo=do_nfo, do_thumb=do_thumb,
+        )
+        result["txn_id"] = txn_id
+        result["rolled_back"] = False
+        result["recovery_required"] = False
+
+        if result["error"]:
+            self.journal.mark_rolling_back(txn_id)
+            restored_ok, warnings = _rollback_tv_apply(episode.path, pre_apply, result)
+            _finalize_failed_apply(self.journal, txn_id, result, restored_ok, warnings)
+        else:
+            after_state = {"nfo_path": result.get("nfo_path"), "thumb_path": result.get("thumb_path")}
+            media_fp = _file_fingerprint(result["new_path"])
+            if media_fp:
+                after_state["media_size"] = media_fp["size"]
+                after_state["media_mtime_ns"] = media_fp["mtime_ns"]
+                after_state["media_hash"] = media_fp["hash"]
+            nfo_fp = _file_fingerprint(result.get("nfo_path"))
+            if nfo_fp:
+                after_state["nfo_size"] = nfo_fp["size"]
+                after_state["nfo_mtime_ns"] = nfo_fp["mtime_ns"]
+                after_state["nfo_hash"] = nfo_fp["hash"]
+            thumb_fp = _file_fingerprint(result.get("thumb_path"))
+            if thumb_fp:
+                after_state["thumb_size"] = thumb_fp["size"]
+                after_state["thumb_mtime_ns"] = thumb_fp["mtime_ns"]
+                after_state["thumb_hash"] = thumb_fp["hash"]
+
+            self.journal.commit(txn_id, result["new_path"], after_state=after_state)
+            if existing:
+                self.journal.mark_superseded(existing.id)
+
+            with self._lock:
+                if episode.path in self.episodes:
+                    del self.episodes[episode.path]
+                refreshed = episode_scanner_module.read_episode(result["new_path"])
+                refreshed.match = episode.match
+                self.episodes[refreshed.path] = refreshed
+                if episode.path in self.order:
+                    idx = self.order.index(episode.path)
+                    self.order[idx] = refreshed.path
+
+        return result
+
+    # ------------------------------------------------------------ undo
+    def undo(self, episode_id: str) -> dict:
+        txn = self.journal.get_active_for_path("tv", episode_id)
+        if not txn:
+            raise ValueError("Nothing to undo for this file.")
+        return self._undo_txn(txn)
+
+    def undo_all(self) -> dict:
+        txns = self.journal.list_undoable("tv", folder=self.folder)
+        results = [self._undo_txn(t) for t in txns]
+        succeeded = sum(1 for r in results if not r["error"])
+        return {"restored": succeeded, "results": results}
+
+    def _undo_txn(self, txn: journal_module.Transaction) -> dict:
+        current_path = txn.current_path
+        original_path = txn.original_path
+        snapshot = txn.before_state
+        after_state = txn.after_state or {}
+        result = {"restored_path": current_path, "error": None, "warnings": []}
+
+        if _fingerprint_changed(current_path, after_state.get("media_size"), after_state.get("media_mtime_ns"), after_state.get("media_hash")):
+            result["error"] = (
+                "This file has changed since MetaMatch applied this match "
+                "(size/modification time no longer match) - undo refused to "
+                "avoid modifying a different file. Rescan if you still want to change it."
+            )
+            return result
+
+        try:
+            has_exact_paths = "nfo_path" in after_state or "thumb_path" in after_state
+            if has_exact_paths:
+                nfo_current = after_state.get("nfo_path")
+                thumb_current = after_state.get("thumb_path")
+            else:
+                nfo_current = None
+                thumb_current = None
+                result["warnings"].append(
+                    "This transaction predates exact sidecar tracking, so its .nfo/thumbnail "
+                    "(if any) were left untouched - check them manually if needed."
+                )
+
+            if nfo_current and _fingerprint_changed(nfo_current, after_state.get("nfo_size"), after_state.get("nfo_mtime_ns"), after_state.get("nfo_hash")):
+                result["warnings"].append(
+                    f"Skipped restoring '{os.path.basename(nfo_current)}' - it has changed since apply."
+                )
+                nfo_current = None
+            if thumb_current and _fingerprint_changed(thumb_current, after_state.get("thumb_size"), after_state.get("thumb_mtime_ns"), after_state.get("thumb_hash")):
+                result["warnings"].append(
+                    f"Skipped restoring '{os.path.basename(thumb_current)}' - it has changed since apply."
+                )
+                thumb_current = None
+
+            path_to_use = current_path
+            if current_path != original_path and os.path.exists(current_path):
+                if os.path.exists(original_path):
+                    raise FileExistsError(
+                        f"Can't restore the original filename - '{os.path.basename(original_path)}' "
+                        "already exists again in that folder."
+                    )
+                os.rename(current_path, original_path)
+                path_to_use = original_path
+
+                base_original = os.path.splitext(original_path)[0]
+                if nfo_current and os.path.exists(nfo_current):
+                    nfo_current = movie_tagger_module._safe_move(nfo_current, base_original + ".nfo")
+                if thumb_current and os.path.exists(thumb_current):
+                    thumb_current = movie_tagger_module._safe_move(thumb_current, base_original + tv_tagger_module.THUMB_SUFFIX)
+
+            nfo_bytes = _unb64_or_none(snapshot.get("nfo_bytes_b64"))
+            thumb_bytes = _unb64_or_none(snapshot.get("thumb_bytes_b64"))
+
+            if nfo_current:
+                if not snapshot.get("had_nfo"):
+                    if os.path.exists(nfo_current):
+                        os.remove(nfo_current)
+                elif nfo_bytes is not None:
+                    with open(nfo_current, "wb") as f:
+                        f.write(nfo_bytes)
+
+            if thumb_current:
+                if not snapshot.get("had_thumb"):
+                    if os.path.exists(thumb_current):
+                        os.remove(thumb_current)
+                elif thumb_bytes is not None:
+                    with open(thumb_current, "wb") as f:
+                        f.write(thumb_bytes)
+
+            ext = os.path.splitext(path_to_use)[1].lower()
+            if ext in (".mp4", ".m4v"):
+                from mutagen.mp4 import MP4
+                audio = MP4(path_to_use)
+                changed = False
+                if snapshot.get("tag_title"):
+                    audio["\xa9nam"] = [snapshot["tag_title"]]
+                    changed = True
+                elif "\xa9nam" in audio:
+                    del audio["\xa9nam"]
+                    changed = True
+                if snapshot.get("tag_year"):
+                    audio["\xa9day"] = [str(snapshot["tag_year"])]
+                    changed = True
+                elif "\xa9day" in audio:
+                    del audio["\xa9day"]
+                    changed = True
+                # Clear the TV-only atoms an apply added.
+                for atom in ("tvsh", "tvsn", "tves", "stik", "\xa9ART"):
+                    if atom in audio:
+                        del audio[atom]
+                        changed = True
+                if changed:
+                    audio.save()
+
+            result["restored_path"] = path_to_use
+            self.journal.mark_rolled_back(txn.id)
+
+            with self._lock:
+                if current_path in self.episodes:
+                    del self.episodes[current_path]
+                refreshed = episode_scanner_module.read_episode(path_to_use)
+                self.episodes[refreshed.path] = refreshed
+                if current_path in self.order:
+                    idx = self.order.index(current_path)
+                    self.order[idx] = refreshed.path
+
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    # ------------------------------------------------------- duplicates
+    def find_duplicates(self) -> dict:
+        with self._lock:
+            episodes = [self.episodes[p] for p in self.order]
+        if not episodes:
+            raise ValueError("Scan a folder first.")
+        return {
+            "exact": dedup_module.find_exact_duplicates(episodes),
+            "probable": dedup_module.find_probable_duplicates_episodes(episodes),
+        }
+
+    def quarantine(self, paths: list[str]) -> dict:
+        with self._lock:
+            folder = self.folder
+            valid_paths = [p for p in paths if p in self.episodes]
+            fingerprints = {p: (self.episodes[p].size_bytes, self.episodes[p].mtime_ns, self.episodes[p].content_hash) for p in valid_paths}
+
+        if not folder:
+            raise ValueError("Scan a folder first.")
+        if not paths:
+            raise ValueError("No files selected.")
+
+        rejected = [p for p in paths if p not in valid_paths]
+        results = []
+
+        still_valid = []
+        for p in valid_paths:
+            size, mtime_ns, content_hash = fingerprints[p]
+            if _fingerprint_changed(p, size, mtime_ns, content_hash):
+                results.append({
+                    "original_path": p, "new_path": None,
+                    "error": "File changed on disk since it was scanned - rescan before quarantining.",
+                })
+            elif os.path.isfile(p):
+                still_valid.append(p)
+
+        all_paths = []
+        for p in still_valid:
+            all_paths.append(p)
+            base = os.path.splitext(p)[0]
+            for suffix in (".nfo", tv_tagger_module.THUMB_SUFFIX):
+                sidecar = base + suffix
+                if os.path.isfile(sidecar):
+                    all_paths.append(sidecar)
+
+        results = dedup_module.quarantine(all_paths, folder) + results
+        for p in rejected:
+            results.append({
+                "original_path": p, "new_path": None,
+                "error": "Refused: not a file from the current scan.",
+            })
+
+        with self._lock:
+            for r in results:
+                if not r["error"] and r["original_path"] in self.episodes:
+                    del self.episodes[r["original_path"]]
+                    if r["original_path"] in self.order:
+                        self.order.remove(r["original_path"])
+
+        moved = sum(1 for r in results if not r["error"])
+        return {"moved": moved, "results": results}
+
+    # ------------------------------------------------- series metadata
+    def _series_root_for(self, episode_path: str) -> str:
+        """The show's root folder: the episode's parent, or its grandparent
+        when the episode sits in a 'Season NN' subfolder."""
+        parent = os.path.dirname(episode_path)
+        if episode_scanner_module._SEASON_FOLDER_RE.match(os.path.basename(parent)):
+            return os.path.dirname(parent)
+        return parent
+
+    def write_series_metadata(self, min_confidence: float = 75.0,
+                              do_poster: bool = True, do_season_posters: bool = True) -> dict:
+        """For each distinct series among the matched episodes, write a
+        tvshow.nfo (and, optionally, a series poster + season posters) at the
+        show's root folder. Each series is one journaled, rollback-protected
+        transaction (kind 'tv_series'), so a mid-write failure leaves that
+        series' folder exactly as it was."""
+        min_confidence = _validate_confidence(min_confidence)
+        with self._lock:
+            eps = [self.episodes[p] for p in self.order]
+
+        groups: dict = {}
+        for e in eps:
+            m = e.match or {}
+            if not m.get("series_tmdb_id") or m.get("confidence", 0) < min_confidence:
+                continue
+            root = self._series_root_for(e.path)
+            g = groups.setdefault((m["series_tmdb_id"], root),
+                                  {"series_id": m["series_tmdb_id"], "root": root, "seasons": set()})
+            if e.season is not None:
+                g["seasons"].add(e.season)
+
+        results = []
+        for (series_id, root), g in groups.items():
+            results.append(self._write_one_series(series_id, root, sorted(g["seasons"]),
+                                                   do_poster, do_season_posters))
+
+        succeeded = sum(1 for r in results if not r["error"])
+        return {
+            "series": len(results), "succeeded": succeeded, "failed": len(results) - succeeded,
+            "results": results,
+        }
+
+    def _write_one_series(self, series_id: int, series_root: str, seasons: list,
+                          do_poster: bool, do_season_posters: bool) -> dict:
+        result = {
+            "series_root": series_root, "series_id": series_id, "series_name": None,
+            "error": None, "written": [], "warnings": [],
+            "txn_id": None, "rolled_back": False, "recovery_required": False,
+        }
+        try:
+            details = tv_matcher_module.fetch_series_details(series_id)
+        except movie_matcher_module.TmdbNotConfigured as e:
+            result["error"] = str(e)
+            return result
+        if not details:
+            result["error"] = "Couldn't fetch series details from TMDB."
+            return result
+        result["series_name"] = details.get("name")
+
+        season_urls = {}
+        if do_season_posters:
+            for s in seasons:
+                try:
+                    url = tv_matcher_module.fetch_season_poster_url(series_id, s)
+                except movie_matcher_module.TmdbNotConfigured as e:
+                    result["error"] = str(e)
+                    return result
+                if url:
+                    season_urls[s] = url
+
+        nfo_path = tv_tagger_module.series_nfo_path(series_root)
+        targets = [nfo_path]
+        if do_poster and details.get("poster_url_full"):
+            targets.append(tv_tagger_module.series_poster_path(series_root))
+        for s in season_urls:
+            targets.append(tv_tagger_module.season_poster_path(series_root, s))
+
+        snapshot_artifacts = {}
+        for t in targets:
+            snap_bytes = _read_small_file(t, _MAX_SIDECAR_SNAPSHOT_BYTES)
+            snapshot_artifacts[os.path.abspath(t)] = {
+                "had": os.path.exists(t),
+                "bytes_b64": _b64_or_none(snap_bytes),
+            }
+        before_state = {"artifacts": snapshot_artifacts}
+        operation = {"type": "series_metadata", "series_root": series_root, "seasons": list(seasons)}
+
+        txn_id = self.journal.begin("tv_series", nfo_path, nfo_path, before_state, operation)
+        result["txn_id"] = txn_id
+        self.journal.mark_applying(txn_id)
+
+        written = []
+        try:
+            written.append(tv_tagger_module.write_tvshow_nfo(series_root, details))
+            if do_poster and details.get("poster_url_full"):
+                p = tv_tagger_module.download_image(details["poster_url_full"],
+                                                    tv_tagger_module.series_poster_path(series_root))
+                if p:
+                    written.append(p)
+                else:
+                    result["warnings"].append("Series poster download failed (nfo still written).")
+            for s, url in season_urls.items():
+                p = tv_tagger_module.download_image(url, tv_tagger_module.season_poster_path(series_root, s))
+                if p:
+                    written.append(p)
+                else:
+                    result["warnings"].append(f"Season {s} poster download failed.")
+
+            result["written"] = written
+            after = {"written": [os.path.abspath(w) for w in written], "fingerprints": {}}
+            for w in written:
+                fp = _file_fingerprint(w)
+                if fp:
+                    after["fingerprints"][os.path.abspath(w)] = fp
+            self.journal.commit(txn_id, nfo_path, after_state=after)
+        except Exception as e:
+            result["error"] = str(e)
+            self.journal.mark_rolling_back(txn_id)
+            restored_ok, warns = _revert_series_artifacts(snapshot_artifacts)
+            _finalize_failed_apply(self.journal, txn_id, result, restored_ok, warns)
+
+        return result
+
+    def undo_series_metadata_all(self) -> dict:
+        """Revert every series-metadata write (deletes tvshow.nfo/posters we
+        created, restores any we overwrote), skipping artifacts the user has
+        since changed."""
+        txns = self.journal.list_undoable("tv_series", folder=None)
+        results = []
+        for txn in txns:
+            snap = (txn.before_state or {}).get("artifacts", {})
+            fps = (txn.after_state or {}).get("fingerprints", {})
+            ok, warns = _revert_series_artifacts(snap, fingerprints=fps)
+            self.journal.mark_rolled_back(txn.id)
+            results.append({"series_root": (txn.operation or {}).get("series_root"),
+                            "restored": ok, "warnings": warns})
+        return {"reverted": len(results), "results": results}
+
+    # ----------------------------------------------------------- export
+    def export_csv(self) -> str:
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "file_path", "series_guess", "season", "episode",
+            "matched_series", "matched_episode_title", "confidence", "tmdb_url",
+        ])
+        with self._lock:
+            for p in self.order:
+                e = self.episodes[p]
+                m = e.match or {}
+                writer.writerow([_csv_safe(val) for val in [
+                    e.path, e.series_guess or "", e.season if e.season is not None else "",
+                    e.episode if e.episode is not None else "",
+                    m.get("series_name", ""), m.get("episode_title", ""),
+                    m.get("confidence", ""), m.get("tmdb_url", ""),
                 ]])
         return buf.getvalue()

@@ -295,23 +295,30 @@ exportBtn.addEventListener("click", () => {
 
 const tabMusicBtn = el("tabMusicBtn");
 const tabMoviesBtn = el("tabMoviesBtn");
+const tabTvBtn = el("tabTvBtn");
 const musicView = el("musicView");
 const moviesView = el("moviesView");
+const tvView = el("tvView");
 const counterLabel = el("counterLabel");
 
 function switchTab(view) {
-  const isMusic = view === "music";
-  musicView.hidden = !isMusic;
-  moviesView.hidden = isMusic;
-  tabMusicBtn.classList.toggle("active", isMusic);
-  tabMoviesBtn.classList.toggle("active", !isMusic);
-  counterLabel.textContent = isMusic ? "TRACKS" : "MOVIES";
-  counterValue.textContent = String(isMusic ? TRACKS.length : MOVIES.length).padStart(3, "0");
-  if (!isMusic) checkTmdbSettings();
+  musicView.hidden = view !== "music";
+  moviesView.hidden = view !== "movies";
+  tvView.hidden = view !== "tv";
+  tabMusicBtn.classList.toggle("active", view === "music");
+  tabMoviesBtn.classList.toggle("active", view === "movies");
+  tabTvBtn.classList.toggle("active", view === "tv");
+
+  const counts = { music: TRACKS.length, movies: MOVIES.length, tv: EPISODES.length };
+  const labels = { music: "TRACKS", movies: "MOVIES", tv: "EPISODES" };
+  counterLabel.textContent = labels[view];
+  counterValue.textContent = String(counts[view]).padStart(3, "0");
+  if (view !== "music") checkTmdbSettings();
 }
 
 tabMusicBtn.addEventListener("click", () => switchTab("music"));
 tabMoviesBtn.addEventListener("click", () => switchTab("movies"));
+tabTvBtn.addEventListener("click", () => switchTab("tv"));
 
 /* ------------------------------ Movies -------------------------------- */
 
@@ -352,14 +359,23 @@ let MOVIES = [];
 let movieProgressTimer = null;
 let tmdbConfigured = false;
 
+const tvTmdbSettingsPanel = el("tvTmdbSettingsPanel");
+const tvTmdbKeyInput = el("tvTmdbKeyInput");
+const saveTvTmdbKeyBtn = el("saveTvTmdbKeyBtn");
+const tvTmdbStatus = el("tvTmdbStatus");
+
 async function checkTmdbSettings() {
   try {
     const resp = await fetch("/api/settings/tmdb");
     const data = await resp.json();
     tmdbConfigured = data.configured;
+    // The TMDB key is shared by Movies and TV, so both panels reflect it.
     tmdbSettingsPanel.hidden = data.configured;
+    tvTmdbSettingsPanel.hidden = data.configured;
     if (data.configured) {
-      tmdbStatus.textContent = `Using key ${data.masked_key}`;
+      const label = `Using key ${data.masked_key}`;
+      tmdbStatus.textContent = label;
+      tvTmdbStatus.textContent = label;
     }
     if (!data.ffprobe_available) {
       movieScanStatus.textContent = "Warning: ffprobe wasn't found on this machine — duration and embedded tags won't be read, but filename-based matching will still work.";
@@ -369,10 +385,10 @@ async function checkTmdbSettings() {
   }
 }
 
-saveTmdbKeyBtn.addEventListener("click", async () => {
-  const key = tmdbKeyInput.value.trim();
+async function saveTmdbKey(keyInput, statusBtn) {
+  const key = keyInput.value.trim();
   if (!key) { showToast("Enter a TMDB API key.", true); return; }
-  saveTmdbKeyBtn.disabled = true;
+  statusBtn.disabled = true;
   try {
     const resp = await fetch("/api/settings/tmdb", {
       method: "POST",
@@ -383,14 +399,19 @@ saveTmdbKeyBtn.addEventListener("click", async () => {
     if (!resp.ok) throw new Error(data.error || "Couldn't save key.");
     tmdbConfigured = true;
     tmdbSettingsPanel.hidden = true;
+    tvTmdbSettingsPanel.hidden = true;
     tmdbKeyInput.value = "";
+    tvTmdbKeyInput.value = "";
     showToast("TMDB key saved.");
   } catch (e) {
     showToast(e.message, true);
   } finally {
-    saveTmdbKeyBtn.disabled = false;
+    statusBtn.disabled = false;
   }
-});
+}
+
+saveTmdbKeyBtn.addEventListener("click", () => saveTmdbKey(tmdbKeyInput, saveTmdbKeyBtn));
+saveTvTmdbKeyBtn.addEventListener("click", () => saveTmdbKey(tvTmdbKeyInput, saveTvTmdbKeyBtn));
 
 function movieConfidenceClass(score) {
   if (score >= 80) return "high";
@@ -688,7 +709,7 @@ movieScanDupesBtn.addEventListener("click", async () => {
     `;
 
     el("movieQuarantineBtn").addEventListener("click", async () => {
-      const checked = Array.from(document.querySelectorAll(".movie-dupe-check:checked")).map(c => c.dataset.path);
+      const checked = Array.from(movieDedupResults.querySelectorAll(".movie-dupe-check:checked")).map(c => c.dataset.path);
       if (checked.length === 0) { showToast("No files checked.", true); return; }
       const qbtn = el("movieQuarantineBtn");
       qbtn.disabled = true;
@@ -807,7 +828,7 @@ async function checkRecoveryNotices() {
     const detail = el("recoveryBannerDetail");
 
     const attention = data.needs_attention || [];
-    const startup = [...(data.music || []), ...(data.movies || [])];
+    const startup = [...(data.music || []), ...(data.movies || []), ...(data.tv || [])];
 
     if (attention.length > 0) {
       // Files that may be left inconsistent and couldn't be auto-restored -
@@ -928,3 +949,375 @@ browseSelectBtn.addEventListener("click", () => {
 
 el("browseBtn").addEventListener("click", () => openBrowseModal(folderInput));
 el("movieBrowseBtn").addEventListener("click", () => openBrowseModal(movieFolderInput));
+el("tvBrowseBtn").addEventListener("click", () => openBrowseModal(tvFolderInput));
+
+
+/* ================================ TV ================================== */
+/* The episode analogue of the Movies module above. Same shapes and flow,
+   pointed at /api/tv/* and rendering series/season/episode instead of a
+   movie title + year. */
+
+let EPISODES = [];
+let tvProgressTimer = null;
+
+const tvFolderInput = el("tvFolderInput");
+const tvRecursiveCheck = el("tvRecursiveCheck");
+const tvScanBtn = el("tvScanBtn");
+const tvScanStatus = el("tvScanStatus");
+
+const tvActionPanel = el("tvActionPanel");
+const tvMatchBtn = el("tvMatchBtn");
+const tvProgressWrap = el("tvProgressWrap");
+const tvProgressFill = el("tvProgressFill");
+const tvProgressLabel = el("tvProgressLabel");
+const tvApplyRow = el("tvApplyRow");
+const tvThresholdInput = el("tvThresholdInput");
+const tvThresholdValue = el("tvThresholdValue");
+const tvRenameCheck = el("tvRenameCheck");
+const tvNfoCheck = el("tvNfoCheck");
+const tvThumbCheck = el("tvThumbCheck");
+const tvTagCheck = el("tvTagCheck");
+const tvApplyAllBtn = el("tvApplyAllBtn");
+const tvSeriesMetaBtn = el("tvSeriesMetaBtn");
+const tvUndoAllBtn = el("tvUndoAllBtn");
+const tvExportBtn = el("tvExportBtn");
+
+const tvDedupPanel = el("tvDedupPanel");
+const tvScanDupesBtn = el("tvScanDupesBtn");
+const tvDedupResults = el("tvDedupResults");
+
+const tvTablePanel = el("tvTablePanel");
+const tvTableBody = el("tvTableBody");
+
+function seasonEpisodeLabel(ep) {
+  if (ep.season === null || ep.season === undefined || ep.episode === null || ep.episode === undefined) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  const eps = ep.episodes && ep.episodes.length > 1
+    ? `E${pad(ep.episodes[0])}-E${pad(ep.episodes[ep.episodes.length - 1])}`
+    : `E${pad(ep.episode)}`;
+  return `S${pad(ep.season)}${eps}`;
+}
+
+function tvParsedHtml(ep) {
+  if (!ep.parsed) return `<span class="missing">couldn't parse an episode</span>`;
+  const tag = seasonEpisodeLabel(ep);
+  return `<div class="tag-line"><strong>${escapeHtml(ep.series_guess)}</strong> · ${escapeHtml(tag)}${ep.episode_title_guess ? " · " + escapeHtml(ep.episode_title_guess) : ""}</div>`;
+}
+
+function tvMatchHtml(ep) {
+  if (!ep.match) return `<span class="no-match">not searched yet</span>`;
+  const m = ep.match;
+  const thumb = m.still_url
+    ? `<img class="match-thumb poster-thumb" src="${m.still_url}" alt="" loading="lazy" onerror="this.style.display='none'">`
+    : `<div class="match-thumb match-thumb-empty"></div>`;
+  const epTag = seasonEpisodeLabel({ season: m.season, episode: m.episode, episodes: m.episodes });
+  const title = m.episode_title || (m.episode_missing ? "episode not found on TMDB" : "Untitled episode");
+  return `
+    <div class="match-row">
+      ${thumb}
+      <div class="match-text">
+        <div class="match-artist">${escapeHtml(m.series_name || "Unknown series")} · ${escapeHtml(epTag)}</div>
+        <div class="match-title">${escapeHtml(title)}${m.vote_average ? " · ★ " + m.vote_average.toFixed(1) : ""}</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderTvTable() {
+  tvTableBody.innerHTML = EPISODES.map((ep, idx) => {
+    const conf = ep.match ? ep.match.confidence : null;
+    return `
+      <tr data-id="${escapeHtml(ep.id)}">
+        <td class="col-file">
+          <span class="file-name">${escapeHtml(ep.filename)}</span>
+          <span class="file-path">${escapeHtml(ep.path)}</span>
+        </td>
+        <td class="col-current">${tvParsedHtml(ep)}</td>
+        <td class="col-match">${tvMatchHtml(ep)}</td>
+        <td class="col-confidence">${conf !== null ? movieVuMeterHtml(conf) : `<span class="no-match">&mdash;</span>`}</td>
+        <td class="col-actions">
+          <div class="row-actions">
+            <button class="btn btn-ghost tv-apply-row-btn" data-idx="${idx}" ${ep.match ? "" : "disabled"}>Apply</button>
+            <button class="btn btn-ghost tv-undo-row-btn" data-idx="${idx}" ${ep.can_undo ? "" : "disabled"}>Undo</button>
+          </div>
+          <div class="row-status" data-tv-status-for="${escapeHtml(ep.id)}"></div>
+        </td>
+      </tr>
+    `;
+  }).join("");
+
+  document.querySelectorAll(".tv-apply-row-btn").forEach((btn) => {
+    btn.addEventListener("click", () => applyTvSingle(parseInt(btn.dataset.idx, 10)));
+  });
+  document.querySelectorAll(".tv-undo-row-btn").forEach((btn) => {
+    btn.addEventListener("click", () => undoTvSingle(parseInt(btn.dataset.idx, 10)));
+  });
+
+  counterValue.textContent = String(EPISODES.length).padStart(3, "0");
+}
+
+tvScanBtn.addEventListener("click", async () => {
+  const folder = tvFolderInput.value.trim();
+  if (!folder) { showToast("Enter a folder path first.", true); return; }
+  tvScanBtn.disabled = true;
+  tvScanStatus.textContent = "Scanning...";
+  try {
+    const resp = await fetch("/api/tv/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder, recursive: tvRecursiveCheck.checked }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Scan failed.");
+
+    EPISODES = data.episodes;
+    renderTvTable();
+    const parsed = EPISODES.filter(e => e.parsed).length;
+    tvScanStatus.textContent = `Found ${data.count} video file${data.count === 1 ? "" : "s"} in ${data.folder} — ${parsed} parsed as episodes.`;
+    if (!data.ffprobe_available) {
+      tvScanStatus.textContent += " (ffprobe not found — durations skipped, filenames still parsed.)";
+    }
+    tvActionPanel.hidden = false;
+    tvDedupPanel.hidden = false;
+    tvDedupResults.innerHTML = "";
+    tvTablePanel.hidden = EPISODES.length === 0;
+  } catch (e) {
+    tvScanStatus.textContent = e.message;
+    showToast(e.message, true);
+  } finally {
+    tvScanBtn.disabled = false;
+  }
+});
+
+tvMatchBtn.addEventListener("click", async () => {
+  if (!tmdbConfigured) {
+    tvTmdbSettingsPanel.hidden = false;
+    showToast("Add a TMDB API key first.", true);
+    return;
+  }
+  tvMatchBtn.disabled = true;
+  tvProgressWrap.hidden = false;
+  try {
+    const resp = await fetch("/api/tv/match/start", { method: "POST" });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Could not start matching.");
+    pollTvProgress();
+  } catch (e) {
+    showToast(e.message, true);
+    tvMatchBtn.disabled = false;
+  }
+});
+
+function pollTvProgress() {
+  clearInterval(tvProgressTimer);
+  tvProgressTimer = setInterval(async () => {
+    const resp = await fetch("/api/tv/match/progress");
+    const p = await resp.json();
+    const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+    tvProgressFill.style.width = pct + "%";
+    tvProgressLabel.textContent = `${p.done} / ${p.total}`;
+
+    if (!p.running) {
+      clearInterval(tvProgressTimer);
+      tvMatchBtn.disabled = false;
+      tvApplyRow.hidden = false;
+      await refreshTv();
+      showToast(p.error ? p.error : "Matching complete.", !!p.error);
+    }
+  }, 600);
+}
+
+async function refreshTv() {
+  const resp = await fetch("/api/tv");
+  const data = await resp.json();
+  EPISODES = data.episodes;
+  renderTvTable();
+}
+
+async function applyTvSingle(idx) {
+  const ep = EPISODES[idx];
+  try {
+    const resp = await fetch("/api/tv/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: ep.id,
+        tag: tvTagCheck.checked,
+        rename: tvRenameCheck.checked,
+        nfo: tvNfoCheck.checked,
+        thumb: tvThumbCheck.checked,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || data.error) throw new Error(data.error || "Failed to apply.");
+    showToast(data.renamed ? `Renamed → ${data.new_path.split("/").pop()}` : "Applied");
+    if (data.recovery_required) showToast("A rollback couldn't fully restore this file — check it (see recovery notices).", true);
+    await refreshTv();
+  } catch (e) {
+    showToast(e.message, true);
+  }
+}
+
+async function undoTvSingle(idx) {
+  const ep = EPISODES[idx];
+  try {
+    const resp = await fetch("/api/tv/undo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: ep.id }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || data.error) throw new Error(data.error || "Failed to undo.");
+    showToast("Reverted " + (data.restored_path || "").split("/").pop());
+    if (data.warnings && data.warnings.length > 0) data.warnings.forEach(w => showToast(w, true));
+    await refreshTv();
+  } catch (e) {
+    showToast(e.message, true);
+  }
+}
+
+tvThresholdInput.addEventListener("input", () => {
+  tvThresholdValue.textContent = tvThresholdInput.value + "%";
+});
+
+tvApplyAllBtn.addEventListener("click", async () => {
+  tvApplyAllBtn.disabled = true;
+  try {
+    const resp = await fetch("/api/tv/apply_all", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tag: tvTagCheck.checked,
+        rename: tvRenameCheck.checked,
+        nfo: tvNfoCheck.checked,
+        thumb: tvThumbCheck.checked,
+        min_confidence: parseFloat(tvThresholdInput.value),
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Bulk apply failed.");
+    if (data.failed > 0) {
+      showToast(`${data.succeeded} succeeded, ${data.failed} failed (of ${data.attempted} at or above ${tvThresholdInput.value}%). Check rows for errors.`, true);
+    } else {
+      showToast(`Applied to ${data.succeeded} file(s) at or above ${tvThresholdInput.value}% confidence.`);
+    }
+    await refreshTv();
+  } catch (e) {
+    showToast(e.message, true);
+  } finally {
+    tvApplyAllBtn.disabled = false;
+  }
+});
+
+tvUndoAllBtn.addEventListener("click", async () => {
+  tvUndoAllBtn.disabled = true;
+  try {
+    const resp = await fetch("/api/tv/undo_all", { method: "POST" });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Undo all failed.");
+    // Also revert any series-level metadata (tvshow.nfo / posters) written.
+    const sResp = await fetch("/api/tv/series_metadata/undo", { method: "POST" });
+    const sData = await sResp.json();
+    const seriesReverted = sResp.ok ? (sData.reverted || 0) : 0;
+    const parts = [`${data.restored} file(s)`];
+    if (seriesReverted > 0) parts.push(`${seriesReverted} series' metadata`);
+    showToast(`Reverted ${parts.join(" and ")}.`);
+    await refreshTv();
+  } catch (e) {
+    showToast(e.message, true);
+  } finally {
+    tvUndoAllBtn.disabled = false;
+  }
+});
+
+tvExportBtn.addEventListener("click", () => {
+  window.location.href = "/api/tv/export_csv";
+});
+
+tvSeriesMetaBtn.addEventListener("click", async () => {
+  if (!tmdbConfigured) {
+    tvTmdbSettingsPanel.hidden = false;
+    showToast("Add a TMDB API key first.", true);
+    return;
+  }
+  tvSeriesMetaBtn.disabled = true;
+  try {
+    const resp = await fetch("/api/tv/series_metadata", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        min_confidence: parseFloat(tvThresholdInput.value),
+        poster: true,
+        season_posters: true,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Series metadata failed.");
+    if (data.series === 0) {
+      showToast(`No series at or above ${tvThresholdInput.value}% confidence to write metadata for.`, true);
+    } else if (data.failed > 0) {
+      showToast(`Wrote metadata for ${data.succeeded} series, ${data.failed} failed — check for details.`, true);
+    } else {
+      showToast(`Wrote tvshow.nfo + posters for ${data.succeeded} series.`);
+    }
+    (data.results || []).forEach(r => (r.warnings || []).forEach(w => showToast(w, true)));
+  } catch (e) {
+    showToast(e.message, true);
+  } finally {
+    tvSeriesMetaBtn.disabled = false;
+  }
+});
+
+tvScanDupesBtn.addEventListener("click", async () => {
+  tvScanDupesBtn.disabled = true;
+  tvDedupResults.innerHTML = `<p class="status-line">Hashing files and checking for repeats...</p>`;
+  try {
+    const resp = await fetch("/api/tv/duplicates/scan", { method: "POST" });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Duplicate scan failed.");
+
+    const groups = [...data.exact, ...data.probable];
+    if (groups.length === 0) {
+      tvDedupResults.innerHTML = `<p class="status-line">No duplicates found.</p>`;
+      return;
+    }
+
+    tvDedupResults.innerHTML = `
+      <div class="dupe-groups">
+        ${groups.map((g, i) => movieDedupGroupHtml(g, i)).join("")}
+      </div>
+      <div class="action-row" style="margin-top:16px;">
+        <button id="tvQuarantineBtn" class="btn btn-primary">Move checked files to _metamatch_duplicates</button>
+        <p class="status-line" style="margin:0;">Any .nfo/thumbnail sidecars move with their episode. Files are moved, never deleted.</p>
+      </div>
+    `;
+
+    el("tvQuarantineBtn").addEventListener("click", async () => {
+      const checked = Array.from(tvDedupResults.querySelectorAll(".movie-dupe-check:checked")).map(c => c.dataset.path);
+      if (checked.length === 0) { showToast("No files checked.", true); return; }
+      const qbtn = el("tvQuarantineBtn");
+      qbtn.disabled = true;
+      try {
+        const r = await fetch("/api/tv/duplicates/quarantine", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ paths: checked }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Quarantine failed.");
+        showToast(`Moved ${d.moved} file(s) to the duplicates folder.`);
+        await refreshTv();
+        tvScanDupesBtn.click();
+      } catch (e) {
+        showToast(e.message, true);
+      } finally {
+        qbtn.disabled = false;
+      }
+    });
+  } catch (e) {
+    tvDedupResults.innerHTML = "";
+    showToast(e.message, true);
+  } finally {
+    tvScanDupesBtn.disabled = false;
+  }
+});

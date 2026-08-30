@@ -22,7 +22,7 @@ directly if you only need one piece - e.g. `from metamatch.matcher import
 score_candidate` - without pulling in the stateful library classes.
 """
 
-from .library import MusicLibrary, MovieLibrary
+from .library import MusicLibrary, MovieLibrary, TvLibrary
 
 __version__ = "0.2.0"
-__all__ = ["MusicLibrary", "MovieLibrary", "__version__"]
+__all__ = ["MusicLibrary", "MovieLibrary", "TvLibrary", "__version__"]

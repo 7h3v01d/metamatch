@@ -186,17 +186,23 @@ def sweep_orphan_remux_temps(folder: str, min_age_seconds: int = 300) -> list[st
     return removed
 
 
-def _embed_via_ffmpeg_remux(path: str, match: dict) -> None:
+def remux_with_metadata(path: str, metadata: dict) -> None:
+    """Remux `path` in place, applying the given container-level metadata
+    (a dict of ffmpeg -metadata key -> value), without re-encoding. Writes
+    to a hidden temp file, verifies the stream set is byte-for-byte the same
+    before swapping it in, and never touches the original on any failure.
+    Shared by the movie and TV embedders so both get the same fail-closed
+    guarantees (stream-preservation check, temp cleanup, killed-ffmpeg
+    handling). Raises RuntimeError on any failure, original left intact."""
     if not FFMPEG_AVAILABLE:
         raise RuntimeError("ffmpeg isn't installed/available on PATH, so metadata can't be embedded for this format.")
 
     tmp_path = _remux_tmp_path(path)
 
     metadata_args = []
-    if match.get("title"):
-        metadata_args += ["-metadata", f"title={match['title']}"]
-    if match.get("year"):
-        metadata_args += ["-metadata", f"date={match['year']}"]
+    for key, value in metadata.items():
+        if value is not None and value != "":
+            metadata_args += ["-metadata", f"{key}={value}"]
 
     # -c copy only copies whichever streams ffmpeg selects by default (one
     # video + one audio), silently dropping extra audio tracks, subtitles,
@@ -233,6 +239,13 @@ def _embed_via_ffmpeg_remux(path: str, match: dict) -> None:
         )
 
     os.replace(tmp_path, path)
+
+
+def _embed_via_ffmpeg_remux(path: str, match: dict) -> None:
+    remux_with_metadata(path, {
+        "title": match.get("title"),
+        "date": match.get("year"),
+    })
 
 
 def embed_metadata(path: str, match: dict) -> None:

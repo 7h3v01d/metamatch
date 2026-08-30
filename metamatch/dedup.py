@@ -121,6 +121,41 @@ def find_probable_duplicates(tracks: list) -> list[dict]:
     return groups
 
 
+def _episode_probable_key(ep) -> str | None:
+    """Two episode files are probably the same episode if they resolve to the
+    same TMDB series + season + episode, or (unmatched) parse to the same
+    series name + SxxEyy."""
+    m = ep.match or {}
+    if m.get("series_tmdb_id") and ep.season is not None and ep.episode is not None:
+        return f"tv:{m['series_tmdb_id']}:s{ep.season}e{ep.episode}"
+    if ep.series_guess and ep.season is not None and ep.episode is not None:
+        return f"text:{_normalize_text(ep.series_guess)}|s{ep.season}e{ep.episode}"
+    return None
+
+
+def find_probable_duplicates_episodes(episodes: list) -> list[dict]:
+    by_key: dict[str, list] = defaultdict(list)
+    for e in episodes:
+        key = _episode_probable_key(e)
+        if key:
+            by_key[key].append(e)
+
+    groups = []
+    for key, group in by_key.items():
+        if len(group) <= 1:
+            continue
+        if _all_byte_identical(group):
+            continue
+        label = "Same TMDB episode" if key.startswith("tv:") else "Same series + episode number"
+        groups.append({
+            "type": "probable",
+            "key": key,
+            "label": label,
+            "files": [_file_summary(e) for e in group],
+        })
+    return groups
+
+
 def find_probable_duplicates_movies(videos: list) -> list[dict]:
     by_key: dict[str, list] = defaultdict(list)
     for v in videos:
