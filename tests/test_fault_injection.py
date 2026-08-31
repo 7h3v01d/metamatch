@@ -277,7 +277,7 @@ class TestDbLockContention:
 
         # lock released: the journal is usable and has no leftover pending row
         assert jr.find_incomplete("music") == []
-        assert jr.list_undoable("music") == []
+        assert jr.list_undoable("music", allow_global=True) == []
 
     @requires_ffmpeg
     def test_lock_at_commit_boundary_recovers_as_required(
@@ -599,7 +599,7 @@ class TestJournalWriteFailures:
 
         assert result["error"] and "journal" in result["error"].lower()
         assert _sha256(target["path"]) == before_hash
-        assert not lib.journal.list_undoable("music")   # no committed txn
+        assert not lib.journal.list_undoable("music", allow_global=True)   # no committed txn
 
     @requires_ffmpeg
     def test_commit_failure_keeps_applied_file_but_flags_it(self, music_dir, mock_music_match, monkeypatch):

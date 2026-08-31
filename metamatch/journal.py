@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     after_state TEXT,
     operation TEXT,
     error TEXT,
-    rollback_info TEXT
+    rollback_info TEXT,
+    library_root TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_txn_current_path ON transactions(kind, current_path, status);
 CREATE INDEX IF NOT EXISTS idx_txn_status ON transactions(kind, status);
@@ -100,6 +101,7 @@ class Transaction:
     operation: dict
     error: Optional[str]
     rollback_info: Optional[dict] = None
+    library_root: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -108,6 +110,7 @@ class Transaction:
             "original_path": self.original_path, "current_path": self.current_path,
             "operation": self.operation, "error": self.error,
             "rollback_info": self.rollback_info,
+            "library_root": self.library_root,
         }
 
 
@@ -157,16 +160,25 @@ class Journal:
             # migration so an older journal file opens and keeps working.
             if "rollback_info" not in cols:
                 conn.execute("ALTER TABLE transactions ADD COLUMN rollback_info TEXT")
+            # library_root records which library folder authorised the
+            # operation, so restart Undo (which runs with no active scan) can
+            # re-apply the full authority validation - link/reparse, resolved
+            # containment AND hard-link checks - against the recorded root.
+            if "library_root" not in cols:
+                conn.execute("ALTER TABLE transactions ADD COLUMN library_root TEXT")
 
-    def begin(self, kind: str, original_path: str, current_path: str, before_state: dict, operation: dict) -> int:
-        """Records intent BEFORE any file is touched. Returns the transaction id."""
+    def begin(self, kind: str, original_path: str, current_path: str, before_state: dict,
+              operation: dict, library_root: Optional[str] = None) -> int:
+        """Records intent BEFORE any file is touched. Returns the transaction id.
+        library_root is the authorised library folder for this operation, kept
+        so restart Undo can re-validate authority without a fresh scan."""
         with self._lock, self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO transactions "
-                "(kind, status, created_at, original_path, current_path, before_state, operation) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(kind, status, created_at, original_path, current_path, before_state, operation, library_root) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (kind, PENDING, time.time(), original_path, current_path,
-                 json.dumps(before_state), json.dumps(operation)),
+                 json.dumps(before_state), json.dumps(operation), library_root),
             )
             return cur.lastrowid
 
@@ -269,6 +281,11 @@ class Journal:
                 if "rollback_info" in row.keys() and row["rollback_info"]
                 else None
             ),
+            library_root=(
+                row["library_root"]
+                if "library_root" in row.keys() and row["library_root"]
+                else None
+            ),
         )
 
     def _safe_row_to_txn(self, row: sqlite3.Row) -> Optional[Transaction]:
@@ -311,10 +328,27 @@ class Journal:
 
     def get_undoable_paths(self, kind: str, folder: Optional[str] = None) -> set[str]:
         """Cheap membership-check version of list_undoable, for building
-        'can_undo' flags over a whole library without one query per file."""
-        return {t.current_path for t in self.list_undoable(kind, folder)}
+        'can_undo' flags over a whole library without one query per file.
+        Read-only introspection, so a journal-global scan (folder=None) is
+        allowed here - it only affects which files show an undo affordance."""
+        return {t.current_path for t in self.list_undoable(kind, folder, allow_global=True)}
 
-    def list_undoable(self, kind: str, folder: Optional[str] = None) -> list[Transaction]:
+    def list_undoable(self, kind: str, folder: Optional[str] = None, *,
+                      allow_global: bool = False) -> list[Transaction]:
+        """Committed, undoable transactions of `kind`. With a folder, only
+        those inside it. Without a folder, this would return EVERY undoable
+        transaction in the (deliberately shared, persistent) journal - which
+        is correct for read-only introspection/recovery, but dangerous for a
+        destructive bulk Undo, where it would silently reach across every
+        library MetaMatch has ever recorded. So a journal-global listing must
+        be opted into explicitly with allow_global=True; a destructive caller
+        that reaches here with no folder is refused rather than run globally
+        by accident."""
+        if folder is None and not allow_global:
+            raise ValueError(
+                "Refusing a journal-global undo listing without a library scope. "
+                "A destructive bulk operation must name the library it applies to."
+            )
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM transactions WHERE kind=? AND status=? ORDER BY id DESC",

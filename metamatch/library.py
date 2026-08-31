@@ -31,6 +31,7 @@ import csv
 import io
 import math
 import os
+import stat as stat_module
 import threading
 from typing import Callable, Optional
 
@@ -100,14 +101,30 @@ def _authority_error(root: "str | None", path: str, *, allow_missing: bool = Fal
     """Returns a refusal reason if `path` is not a safe mutation target under
     the active library `root`, else None. Used by every destructive entry
     point (Apply/Undo/Quarantine/series metadata) to re-check authority at
-    mutation time. If there's no active scan root (an undo issued before any
-    scan), it still fails closed on links/reparse points, which is the part
-    that doesn't need a root to judge."""
+    mutation time.
+
+    With a known root, this is the full validate_mutation_target() check. With
+    NO root (an Undo issued after a restart before any scan, on a legacy row
+    that never recorded its root), it still enforces every property that
+    doesn't require knowing the root - reject links/reparse points AND
+    hard-link aliases - so restart recovery can't become a weaker authority
+    path than Apply. (Newer transactions record library_root, so the rooted
+    branch is taken even on restart; this fallback is the legacy safety net.)"""
     if root:
         ok, reason = pathsafe_module.validate_mutation_target(path, root, allow_missing=allow_missing)
         return None if ok else reason
+
     if pathsafe_module.is_link_or_reparse(path):
         return "it is a symlink or reparse point"
+    try:
+        st = os.stat(path)
+    except OSError:
+        if allow_missing and not os.path.lexists(path):
+            return None
+        return "it is unreadable"
+    if stat_module.S_ISREG(st.st_mode) and getattr(st, "st_nlink", 1) > 1:
+        return ("it has multiple hard-link names, so MetaMatch can't prove every "
+                "alias is inside the library")
     return None
 
 
@@ -734,7 +751,7 @@ class MusicLibrary:
         _base = {"original_path": track.path, "new_path": track.path,
                  "tagged": False, "renamed": False, "art_embedded": False, "error": None}
         try:
-            txn_id = self.journal.begin("music", true_original_path, track.path, before_state, operation)
+            txn_id = self.journal.begin("music", true_original_path, track.path, before_state, operation, library_root=self.folder)
         except Exception as e:
             return _journal_unavailable_result(_base, e)
 
@@ -798,6 +815,9 @@ class MusicLibrary:
             return self._undo_txn(txn)
 
     def undo_all(self) -> dict:
+        if not self.folder:
+            raise ValueError("Scan or select a library before using Undo All. "
+                             "(Individual files can still be undone by name after a restart.)")
         txns = self.journal.list_undoable("music", folder=self.folder)
         results = []
         for t in txns:
@@ -811,7 +831,13 @@ class MusicLibrary:
         original_path = txn.original_path
         result = {"restored_path": current_path, "error": None}
 
-        auth = _authority_error(self.folder, current_path)
+        # On a restart, self.folder is None (no active scan) but the journal
+        # recorded which library root authorised this operation - use it so
+        # Undo re-applies the SAME authority validation (link/reparse,
+        # containment AND hard-link) it had at Apply time, rather than the
+        # weaker no-root fallback.
+        auth_root = self.folder or txn.library_root
+        auth = _authority_error(auth_root, current_path)
         if auth:
             result["error"] = f"Refused to undo '{os.path.basename(current_path)}': {auth}."
             return result
@@ -1134,7 +1160,7 @@ class MovieLibrary:
         _base = {"original_path": video.path, "new_path": video.path,
                  "tagged": False, "renamed": False, "nfo_path": None, "poster_path": None, "error": None}
         try:
-            txn_id = self.journal.begin("movie", true_original_path, video.path, snapshot, operation)
+            txn_id = self.journal.begin("movie", true_original_path, video.path, snapshot, operation, library_root=self.folder)
         except Exception as e:
             return _journal_unavailable_result(_base, e)
 
@@ -1207,6 +1233,9 @@ class MovieLibrary:
             return self._undo_txn(txn)
 
     def undo_all(self) -> dict:
+        if not self.folder:
+            raise ValueError("Scan or select a library before using Undo All. "
+                             "(Individual files can still be undone by name after a restart.)")
         txns = self.journal.list_undoable("movie", folder=self.folder)
         results = []
         for t in txns:
@@ -1222,7 +1251,13 @@ class MovieLibrary:
         after_state = txn.after_state or {}
         result = {"restored_path": current_path, "error": None, "warnings": []}
 
-        auth = _authority_error(self.folder, current_path)
+        # On a restart, self.folder is None (no active scan) but the journal
+        # recorded which library root authorised this operation - use it so
+        # Undo re-applies the SAME authority validation (link/reparse,
+        # containment AND hard-link) it had at Apply time, rather than the
+        # weaker no-root fallback.
+        auth_root = self.folder or txn.library_root
+        auth = _authority_error(auth_root, current_path)
         if auth:
             result["error"] = f"Refused to undo '{os.path.basename(current_path)}': {auth}."
             return result
@@ -1697,7 +1732,7 @@ class TvLibrary:
         _base = {"original_path": episode.path, "new_path": episode.path,
                  "tagged": False, "renamed": False, "nfo_path": None, "thumb_path": None, "error": None}
         try:
-            txn_id = self.journal.begin("tv", true_original_path, episode.path, snapshot, operation)
+            txn_id = self.journal.begin("tv", true_original_path, episode.path, snapshot, operation, library_root=self.folder)
         except Exception as e:
             return _journal_unavailable_result(_base, e)
 
@@ -1762,6 +1797,9 @@ class TvLibrary:
             return self._undo_txn(txn)
 
     def undo_all(self) -> dict:
+        if not self.folder:
+            raise ValueError("Scan or select a library before using Undo All. "
+                             "(Individual files can still be undone by name after a restart.)")
         txns = self.journal.list_undoable("tv", folder=self.folder)
         results = []
         for t in txns:
@@ -1777,7 +1815,13 @@ class TvLibrary:
         after_state = txn.after_state or {}
         result = {"restored_path": current_path, "error": None, "warnings": []}
 
-        auth = _authority_error(self.folder, current_path)
+        # On a restart, self.folder is None (no active scan) but the journal
+        # recorded which library root authorised this operation - use it so
+        # Undo re-applies the SAME authority validation (link/reparse,
+        # containment AND hard-link) it had at Apply time, rather than the
+        # weaker no-root fallback.
+        auth_root = self.folder or txn.library_root
+        auth = _authority_error(auth_root, current_path)
         if auth:
             result["error"] = f"Refused to undo '{os.path.basename(current_path)}': {auth}."
             return result
@@ -2009,8 +2053,13 @@ class TvLibrary:
 
         results = []
         for (series_id, root), g in groups.items():
-            results.append(self._write_one_series(series_id, root, sorted(g["seasons"]),
-                                                   do_poster, do_season_posters))
+            # Hold the series-root mutation lock for the whole write (fetch,
+            # snapshot, journal, sidecar writes, commit) so it follows the same
+            # transaction discipline as Apply and can't interleave with another
+            # operation touching the same show folder.
+            with self._mutation_locks.get(root):
+                results.append(self._write_one_series(series_id, root, sorted(g["seasons"]),
+                                                       do_poster, do_season_posters))
 
         succeeded = sum(1 for r in results if not r["error"])
         return {
@@ -2074,7 +2123,7 @@ class TvLibrary:
 
         txn_id = None
         try:
-            txn_id = self.journal.begin("tv_series", nfo_path, nfo_path, before_state, operation)
+            txn_id = self.journal.begin("tv_series", nfo_path, nfo_path, before_state, operation, library_root=self.folder)
             result["txn_id"] = txn_id
             self.journal.mark_applying(txn_id)
         except Exception as e:
@@ -2086,16 +2135,16 @@ class TvLibrary:
 
         written = []
         try:
-            if pathsafe_module.sidecar_write_is_unsafe(nfo_path):
-                result["error"] = "The existing tvshow.nfo is a symlink; refusing to write through it."
+            if _authority_error(self.folder, nfo_path, allow_missing=True):
+                result["error"] = "The tvshow.nfo target isn't a safe path to write (symlink/reparse or escapes the library)."
                 self.journal.mark_rolled_back(txn_id)
                 result["rolled_back"] = True
                 return result
             written.append(tv_tagger_module.write_tvshow_nfo(series_root, details))
             if do_poster and details.get("poster_url_full"):
                 poster_dest = tv_tagger_module.series_poster_path(series_root)
-                if pathsafe_module.sidecar_write_is_unsafe(poster_dest):
-                    result["warnings"].append("Existing series poster is a symlink; left it untouched.")
+                if _authority_error(self.folder, poster_dest, allow_missing=True):
+                    result["warnings"].append("Series poster target isn't a safe path (symlink/escape); left untouched.")
                 elif movie_tagger_module.sidecar_is_protected(poster_dest):
                     result["warnings"].append("Existing series poster too large to back up; left in place.")
                 else:
@@ -2106,8 +2155,8 @@ class TvLibrary:
                         result["warnings"].append("Series poster download failed (nfo still written).")
             for s, url in season_urls.items():
                 season_dest = tv_tagger_module.season_poster_path(series_root, s)
-                if pathsafe_module.sidecar_write_is_unsafe(season_dest):
-                    result["warnings"].append(f"Existing season {s} poster is a symlink; left it untouched.")
+                if _authority_error(self.folder, season_dest, allow_missing=True):
+                    result["warnings"].append(f"Season {s} poster target isn't a safe path (symlink/escape); left untouched.")
                     continue
                 if movie_tagger_module.sidecar_is_protected(season_dest):
                     result["warnings"].append(f"Existing season {s} poster too large to back up; left in place.")
@@ -2139,6 +2188,8 @@ class TvLibrary:
         skipping artifacts the user has since changed. Scoped to self.folder
         so an Undo in one library can't reach into another that shares this
         (deliberately shared, persistent) journal."""
+        if not self.folder:
+            raise ValueError("Scan or select a TV library before undoing all series metadata.")
         txns = self.journal.list_undoable("tv_series", folder=self.folder)
         results = []
         restored_count = 0

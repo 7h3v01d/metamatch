@@ -352,7 +352,10 @@ def api_undo():
 
 @app.route("/api/undo_all", methods=["POST"])
 def api_undo_all():
-    return jsonify(music_library.undo_all())
+    try:
+        return jsonify(music_library.undo_all())
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/duplicates/scan", methods=["POST"])
@@ -498,7 +501,10 @@ def api_movies_undo():
 
 @app.route("/api/movies/undo_all", methods=["POST"])
 def api_movies_undo_all():
-    return jsonify(movie_library.undo_all())
+    try:
+        return jsonify(movie_library.undo_all())
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/movies/duplicates/scan", methods=["POST"])
@@ -621,7 +627,10 @@ def api_tv_undo():
 
 @app.route("/api/tv/undo_all", methods=["POST"])
 def api_tv_undo_all():
-    return jsonify(tv_library.undo_all())
+    try:
+        return jsonify(tv_library.undo_all())
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/tv/duplicates/scan", methods=["POST"])
@@ -666,7 +675,10 @@ def api_tv_series_metadata():
 
 @app.route("/api/tv/series_metadata/undo", methods=["POST"])
 def api_tv_series_metadata_undo():
-    return jsonify(tv_library.undo_series_metadata_all())
+    try:
+        return jsonify(tv_library.undo_series_metadata_all())
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
 
 if __name__ == "__main__":

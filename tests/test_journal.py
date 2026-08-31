@@ -77,7 +77,7 @@ class TestSupersession:
         journal.commit(txn1, "/a.mp3")
         journal.mark_superseded(txn1)
 
-        assert journal.list_undoable("music") == []
+        assert journal.list_undoable("music", allow_global=True) == []
 
 
 class TestKindNamespacing:
@@ -89,8 +89,8 @@ class TestKindNamespacing:
 
         assert journal.get_active_for_path("music", "/song.mp3").id == m_txn
         assert journal.get_active_for_path("movie", "/song.mp3").id == v_txn
-        assert len(journal.list_undoable("music")) == 1
-        assert len(journal.list_undoable("movie")) == 1
+        assert len(journal.list_undoable("music", allow_global=True)) == 1
+        assert len(journal.list_undoable("movie", allow_global=True)) == 1
 
 
 class TestListUndoable:
