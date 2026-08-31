@@ -4,19 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metamatch"
-version = "0.2.0"
-description = "Match local music/movie files against MusicBrainz/TMDB and reconcile tags, filenames, cover art, and duplicates."
+version = "0.2.4"
+description = "Match local music, movie, and TV files against MusicBrainz/TMDB and reconcile tags, filenames, artwork, sidecars, and duplicates."
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Leon Priest" }]
+keywords = ["musicbrainz", "tmdb", "tagging", "metadata", "media", "music", "movies", "tv"]
 dependencies = [
     "requests>=2.31.0",
     "mutagen>=1.47.0",
     "rapidfuzz>=3.6.0",
 ]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Operating System :: OS Independent",
+    "Intended Audience :: End Users/Desktop",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Video",
+    "Environment :: Web Environment",
+]
 
 [project.optional-dependencies]
 webapp = ["flask>=3.0.0"]
 dev = ["pytest>=8.0.0"]
+
+[tool.setuptools]
+license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
 include = ["metamatch*"]

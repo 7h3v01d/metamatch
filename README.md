@@ -1,8 +1,8 @@
 # MetaMatch
 
-*Version 0.2.4. A local, single-user desktop tool — no telemetry, no
-account, no cloud; the only network calls are the metadata lookups you
-trigger (MusicBrainz / TMDB / Cover Art Archive).*
+*Version 0.2.4 · Apache-2.0 · by Leon Priest. A local, single-user desktop
+tool — no telemetry, no account, no cloud; the only network calls are the
+metadata lookups you trigger (MusicBrainz / TMDB / Cover Art Archive).*
 
 A local tool that scans your media folder, reads whatever tags/filenames it
 has, looks each item up against an online database, and shows you a
@@ -635,3 +635,10 @@ tests/
   test_review_022.py                                         Adversarial round: restart-Undo authority via library_root provenance
   test_review_023.py                                           Adversarial round: restart bulk-Undo scope
 ```
+
+## License
+
+Copyright 2026 Leon Priest. Licensed under the Apache License, Version 2.0
+— see [LICENSE](LICENSE). You may use, modify, and redistribute this
+software under those terms; it is provided "as is", without warranty of
+any kind.
