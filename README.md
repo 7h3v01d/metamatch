@@ -1,23 +1,41 @@
 # MetaMatch
 
-A local tool that scans your music folder, reads whatever tags/filenames it
-has, looks each track up on MusicBrainz, and shows you a confidence-scored
-match — then lets you write corrected tags and/or rename files, one at a
-time or in bulk. Movies work the same way against TMDB.
+*Version 0.2.4. A local, single-user desktop tool — no telemetry, no
+account, no cloud; the only network calls are the metadata lookups you
+trigger (MusicBrainz / TMDB / Cover Art Archive).*
+
+A local tool that scans your media folder, reads whatever tags/filenames it
+has, looks each item up against an online database, and shows you a
+confidence-scored match — then lets you write corrected metadata and/or
+rename files, one at a time or in bulk. It handles three kinds of media:
+
+- **Music** → MusicBrainz (with cover art from the Cover Art Archive)
+- **Movies** → TMDB (with `.nfo` sidecars and posters)
+- **TV shows** → TMDB (episode matching, `.nfo` sidecars, thumbnails, plus
+  series-level `tvshow.nfo` and season posters)
 
 It's built in two layers:
 
 - **`metamatch/`** — a plain Python library with no web dependency. All the
-  actual scan/match/apply/undo/duplicate logic lives here as `MusicLibrary`
-  and `MovieLibrary`. Import and use it directly in a script, notebook, or
-  another application — see "Using it as a library" below.
+  actual scan/match/apply/undo/duplicate logic lives here as `MusicLibrary`,
+  `MovieLibrary`, and `TvLibrary`. Import and use it directly in a script,
+  notebook, or another application — see "Using it as a library" below.
 - **`app.py`** — a small local web app (Flask backend, plain HTML/JS
   frontend, no build step) that's just a thin adapter translating HTTP
-  requests into calls against one `MusicLibrary`/`MovieLibrary` instance.
+  requests into calls against one `MusicLibrary`/`MovieLibrary`/`TvLibrary`
+  instance each.
 
 If you only want the app, none of that matters — `python app.py` and go.
 If you want to embed the matching/tagging logic into something bigger,
 the library layer is the point: see "Using it as a library".
+
+MetaMatch edits irreplaceable media in place, so it's built to be
+paranoid about it: every destructive operation re-checks filesystem
+authority and content identity at the moment of mutation, is recorded in
+a persistent journal *before* any file is touched, and either completes,
+rolls back to its captured before-state, or is flagged for a manual check
+— never left silently half-done. See "Safety model" and "Undo history and
+crash recovery" below.
 
 ## What it does
 
@@ -50,6 +68,14 @@ the library layer is the point: see "Using it as a library".
   artist+title, in different rips/encodes). Flagged files are *moved*
   into a `_metamatch_duplicates` folder, never deleted, so it's easy to
   double-check or reverse.
+
+**Movies and TV** work the same way, against TMDB instead of MusicBrainz —
+see "Movie matching" and "TV matching" below for what's different (episode
+filename parsing, `.nfo`/poster/thumbnail sidecars, container-level tag
+embedding, and series-level metadata). The same scan → match → review →
+apply → undo flow, the same confidence slider and CSV export, the same
+duplicate detection and quarantine, and the same journal-backed undo and
+crash recovery apply to all three.
 
 ## Setup (running the web app)
 
@@ -108,20 +134,46 @@ lib.match()
 lib.apply_all(do_rename=True, do_nfo=True, do_poster=True, min_confidence=85)
 ```
 
-**Why this shape:** each `MusicLibrary()`/`MovieLibrary()` instance owns its
-own scanned files, matches, and undo history — no module-level globals, no
-singleton state. Create as many as you need (one per user session, one per
-background job, one per test). The package is named `metamatch`, not
-`core` or something equally likely to collide with a host project's own
-module names, specifically so it's safe to add as a dependency elsewhere.
-The individual modules (`metamatch.scanner`, `metamatch.matcher`,
-`metamatch.tagger`, etc.) are also importable on their own if you only need
-one piece, without pulling in the stateful library classes at all — see
-"Project layout" below for what each one does.
+`TvLibrary` is the episode analogue — it parses `Show.S01E02.Title.ext`
+(and `1x02`, multi-episode files, `Season NN/` subfolders), matches each
+episode against TMDB, and applies `.nfo`/thumbnail sidecars plus the
+Plex/Kodi rename `Show - S01E02 - Title.ext`. It also writes series-level
+artifacts (`tvshow.nfo`, series poster, season posters) at the show root:
+
+```python
+from metamatch import TvLibrary
+from metamatch import config
+
+config.set_tmdb_api_key("your-tmdb-key")
+
+lib = TvLibrary()
+lib.scan("/path/to/tv")
+lib.match()
+lib.apply_all(do_rename=True, do_nfo=True, do_thumb=True, min_confidence=80)
+lib.write_series_metadata(min_confidence=80)   # tvshow.nfo + posters per series
+```
+
+**Why this shape:** each `MusicLibrary()`/`MovieLibrary()`/`TvLibrary()`
+instance owns its own scanned files, matches, and undo history — no
+module-level globals, no singleton state. Create as many as you need (one
+per user session, one per background job, one per test). The package is
+named `metamatch`, not `core` or something equally likely to collide with a
+host project's own module names, specifically so it's safe to add as a
+dependency elsewhere. The individual modules (`metamatch.scanner`,
+`metamatch.matcher`, `metamatch.tagger`, etc.) are also importable on their
+own if you only need one piece, without pulling in the stateful library
+classes at all — see "Project layout" below for what each one does.
 
 
 
 ## Using it
+
+The app opens on the **Music** tab; **Movies** and **TV Shows** tabs at
+the top work the same way (they need a free TMDB API key first — see
+"Movie matching" and "TV matching"). The walkthrough below is written for
+music; movies and TV follow the identical scan → find matches → review →
+apply/undo rhythm, with format-appropriate checkboxes (`.nfo`/poster for
+movies, `.nfo`/thumbnail/series-metadata for TV).
 
 1. Type or paste a folder path into the box (e.g. `/Users/you/Music`), or
    click **Browse…** to navigate to it visually, then click **Scan folder**.
@@ -153,6 +205,62 @@ one piece, without pulling in the stateful library classes at all — see
    checkboxes and click **Move checked files to _metamatch_duplicates** —
    files are moved into that subfolder, not deleted.
 
+## Safety model
+
+MetaMatch modifies files you can't easily get back, so its central design
+goal is that it only ever mutates the file you actually pointed it at,
+only when it can prove that file is still what it scanned, and never in a
+way it can't account for afterward. Three independent invariants back that
+up.
+
+**1. Filesystem authority is checked at the moment of mutation, not just
+at scan.** Scanning a folder rejects symlinks and Windows reparse
+points/junctions, and won't descend into linked subdirectories — so a
+`Library/linked.mp3 -> /elsewhere/victim.mp3` never enters the working
+set. But scan admission alone isn't enough, because filesystem identity is
+mutable: a file that was a normal library member at scan time could be
+swapped for a symlink, hard-linked to an outside inode, or have its parent
+directory replaced with a junction *before* the actual apply runs. So
+every destructive operation — Apply, Undo, Quarantine, and TV series
+metadata — re-validates its target immediately before touching it, under a
+per-file mutation lock, through a single authority gate
+(`pathsafe.validate_mutation_target`) that refuses:
+  - a symlink or reparse point (MetaMatch never follows a link to write
+    through it);
+  - anything whose *resolved* path escapes the selected library root
+    (real-path containment, not a string-prefix check — a `Music_Backup`
+    sibling of `Music` is not "inside" it);
+  - a regular file with more than one hard-link name, whose aliases can't
+    be proven to all live inside the library.
+Every sidecar destination (`.nfo`, poster, thumbnail) is link-checked the
+same way before writing, so a planted `movie.nfo -> /outside/file` symlink
+is left untouched rather than followed.
+
+**2. Content identity is verified independently of the path.** Even when
+the pathname checks out, `apply()`/`undo()`/`quarantine()` re-check the
+file's size, modification time, *and* a content fingerprint against what
+was recorded at scan time, and refuse if anything replaced or modified the
+file since. Path authority and content identity are deliberately separate
+checks — a byte-identical decoy at an authorized path passes the
+fingerprint but can still fail authority (e.g. a hard link), and vice
+versa. (Fingerprint details are under "Notes & limitations".)
+
+**3. Every mutation is journalled and either completes, rolls back, or is
+flagged.** Nothing is touched before the intent is written to a persistent
+SQLite journal; a failure mid-apply is compensated back to the captured
+before-state; a failure that *can't* be cleanly compensated becomes a
+visible `RECOVERY_REQUIRED` state rather than a silent inconsistency. This
+is the subject of the next section.
+
+The one boundary this design doesn't fully close is an ultra-narrow local
+race: a hostile process on the same machine could, in principle, swap a
+path in the microseconds between MetaMatch validating it and the OS
+actually opening it. Eliminating that entirely needs handle-relative /
+no-follow OS primitives that are substantially platform-specific
+(especially on Windows). For a single-user local desktop tool that's a
+documented limitation, not a practical exposure — the pre-mutation
+revalidation closes the realistic stale-swap gap.
+
 ## Notes & limitations
 
 - MusicBrainz lookups need outbound internet access to
@@ -160,13 +268,17 @@ one piece, without pulling in the stateful library classes at all — see
   `coverartarchive.org`. If your machine restricts outbound network
   access, matching/art will silently return no results — scanning and
   manual tag entry still work offline.
-- Undo restores tags, the filename, and (for movies) a pre-existing
-  `.nfo`/poster's exact original content, but not embedded cover art on
-  music files (there's no reliable "no art was here" marker to restore
-  to) — keep the art checkbox off for a file until you're confident in
-  the match if that matters to you. Embedded movie metadata is only
-  reversible for `.mp4`/`.m4v`; the `.mkv`/`.avi`/`.mov`/`.wmv` path goes
-  through an `ffmpeg` remux that isn't cheaply undoable.
+- Undo restores tags, the filename, and (for movies/TV) a pre-existing
+  `.nfo`/poster/thumbnail's exact original content, but not embedded cover
+  art on music files (there's no reliable "no art was here" marker to
+  restore to) — keep the art checkbox off for a file until you're
+  confident in the match if that matters to you. Embedded metadata is
+  cleanly reversible for `.mp4`/`.m4v`; the
+  `.mkv`/`.avi`/`.mov`/`.wmv` path goes through an `ffmpeg` remux that
+  can't be reversed in place, so an apply that embedded via remux and then
+  failed a later step is flagged `RECOVERY_REQUIRED` (the file still
+  carries the applied metadata) rather than being reported as a clean
+  rollback.
 - "Probable" duplicates are a heuristic (same MusicBrainz recording/TMDB
   movie, or matching title text) — nothing is preselected for
   quarantine in that case, unlike byte-identical "exact" duplicates.
@@ -239,50 +351,71 @@ one piece, without pulling in the stateful library classes at all — see
 ## Undo history and crash recovery
 
 Every `apply()` writes to a small SQLite journal (`~/.metamatch/journal.sqlite`
-by default) *before* touching any file, then marks that entry committed
-or failed once the operation finishes. This means:
+by default) *before* touching any file, then drives that transaction
+through an explicit state machine as the operation proceeds:
 
-- **Undo survives a restart.** Close MetaMatch, reopen it, rescan the
-  same folder, and files you applied a match to earlier still show
-  "Undo" as available — the button isn't reading in-memory state that
-  reset when the process restarted, it's reading the journal.
-- **A crash mid-operation is detected, not silently lost.** If the
-  process dies between starting an apply and finishing it (a kill, a
-  power loss, a segfault — anything short of a clean exit), that
-  transaction is left in a "pending" state. The next time a
-  `MusicLibrary`/`MovieLibrary` is constructed (i.e. next time you start
-  the app), it checks for exactly this and marks any such transactions
-  "interrupted." The web UI shows this as a dismissible banner across
-  the top of the page listing which files may have been affected — worth
-  a manual check, since the interrupted operation's outcome is unknown
-  (it might have finished the file write and died before recording that,
-  or died before writing anything at all).
+```
+PENDING → APPLYING → COMMITTED
+                 ↘ ROLLING_BACK → ROLLED_BACK
+                                ↘ RECOVERY_REQUIRED
+```
+
+What this buys you:
+
+- **Automatic rollback.** If an apply fails partway through — the disk
+  fills, a permission is lost, `ffmpeg` is killed — MetaMatch compensates
+  the partial work back to the captured before-state (restores overwritten
+  tags, strips freshly-embedded art, deletes a just-created `.nfo`,
+  restores an overwritten one from a snapshot) and the transaction ends
+  `ROLLED_BACK`. Because rename is always the *last* step of an apply, a
+  failed apply never moved the file, so rollback is purely in place.
+- **`ROLLED_BACK` means the before-state was actually restored.** When a
+  step genuinely can't be reversed — a metadata embed that went through an
+  `ffmpeg` remux rewrites the container in place — the transaction is
+  honestly marked `RECOVERY_REQUIRED` instead, never mislabelled as a
+  clean rollback.
+- **A crash mid-operation is detected, not silently lost.** If the process
+  dies between starting and finishing an apply (a kill, power loss, a
+  segfault), the next `MusicLibrary`/`MovieLibrary`/`TvLibrary`
+  construction runs recovery: a transaction that never got past `PENDING`
+  becomes a benign `INTERRUPTED` (nothing was written); one that died
+  mid-mutation (`APPLYING`/`ROLLING_BACK`) escalates to
+  `RECOVERY_REQUIRED`. A journal row too corrupt to parse (a torn write)
+  is quarantined and flagged rather than crashing startup.
+- **Recovery items are reviewable and resolvable, not just logged.** The
+  web UI surfaces outstanding `RECOVERY_REQUIRED` items in a panel where
+  you can see each file, read what happened, fix it by hand, and mark it
+  resolved — after which it stops resurfacing. These persist across
+  restarts until you clear them, so a file that genuinely needs attention
+  doesn't scroll away.
+- **Undo survives a restart, with authority intact.** Each transaction
+  records the library root that authorised it, so an individual `undo()`
+  works after a restart (before any rescan) while still re-running the
+  full authority validation — link/reparse, containment, *and* hard-link
+  checks — against that recorded root before restoring anything.
+- **Bulk Undo requires an explicit library scope.** Because the journal is
+  deliberately shared and persistent, it can accumulate history for many
+  library roots over time. So "Undo all applied" refuses to run until a
+  library has actually been scanned/selected — it never interprets "no
+  current library" as "every library ever recorded." (Individual undo is
+  still fine via the per-transaction authority above.) The scoping is by
+  real filesystem containment, so a `Music_Backup` sibling of `Music`
+  isn't swept up by name.
 - **Repeated applies to the same file always chain back to the true
-  original**, not to whatever the last apply changed it to — this was
-  true before the journal too (see the double-apply fix mentioned
-  above), but it's now enforced at the persistence layer instead of an
-  in-memory dict, so it holds across restarts too.
-- **"Undo all applied" only ever reaches files actually inside the
-  scanned folder.** It's scoped by real filesystem containment (via
-  `os.path.commonpath`), not a string-prefix check — a folder named
-  `Music_Backup` sitting next to `Music` won't get swept up just because
-  its name happens to start the same way.
+  original**, not to whatever the last apply changed it to, and this holds
+  across restarts because it's enforced at the persistence layer.
 
-What this is *not*: a fully atomic transaction system. A crash between
-writing a tag and renaming a file can still leave that one file
-half-updated — true atomicity there would mean staging every write to a
-temp file and swapping it in at the very end, which `tagger.py`/
-`movie_tagger.py` don't do for every operation (some individual steps,
-like the ffmpeg remux path, already do this — see "Movie matching"
-below). What the journal guarantees is that MetaMatch itself never loses
-track of *what it was trying to do* to *which file*, even across a
-crash, which is what makes both persistent undo and recovery detection
-possible.
+What this is *not*: byte-level atomicity for every individual step. A
+crash in the exact instant between writing a tag and renaming a file can
+still leave that one file half-updated — but MetaMatch will *know* it was
+mid-operation on that file and flag it on restart, which is what makes
+both persistent undo and recovery detection possible. Some individual
+steps (the `ffmpeg` remux path) already stage to a temp file and swap
+atomically; see "Movie matching".
 
-If you use `MusicLibrary`/`MovieLibrary` directly as a library (see
-above), you can point multiple instances at the same journal file to
-share undo history between them, or give each its own path for
-isolation — pass a `metamatch.journal.Journal(path)` instance to either
+If you use the library classes directly, you can point multiple instances
+at the same journal file to share undo history, or give each its own path
+for isolation — pass a `metamatch.journal.Journal(path)` instance to any
 constructor:
 
 ```python
@@ -290,9 +423,8 @@ from metamatch import MusicLibrary
 from metamatch.journal import Journal
 
 lib = MusicLibrary(journal=Journal("/custom/path/journal.sqlite"))
-notices = lib.get_recovery_notices()  # anything interrupted last run
-if notices:
-    print(f"{len(notices)} operation(s) may have been interrupted last run")
+notices = lib.get_recovery_notices()          # anything interrupted last run
+attention = lib.get_outstanding_recovery()     # RECOVERY_REQUIRED, persists until resolved
 ```
 
 ## Project layout
@@ -300,23 +432,27 @@ if notices:
 ```
 metamatch/                (repo root)
   metamatch/                 The library - importable on its own, no Flask dependency
-    __init__.py                 Public API: MusicLibrary, MovieLibrary
-    library.py                    MusicLibrary/MovieLibrary - the stateful orchestration layer
-    journal.py                      Persistent write-ahead undo/crash-recovery log (SQLite)
+    __init__.py                 Public API: MusicLibrary, MovieLibrary, TvLibrary
+    library.py                    The three stateful orchestration classes + shared apply/undo/rollback
+    journal.py                      Persistent write-ahead undo/crash-recovery log (SQLite) + state machine
+    pathsafe.py                       Filesystem-authority gate: link/reparse/hard-link/containment checks
     fingerprint.py                    Content-hash file identity (defeats size+mtime-only staleness checks)
     scanner.py                      Music: folder walking, tag reading, filename parsing
     matcher.py                        Music: MusicBrainz search + confidence scoring
     tagger.py                           Music: tag writing, cover art embedding, renaming
     art.py                                Music: Cover Art Archive lookups (cached)
-    dedup.py                                Shared: duplicate detection, quarantine (music + movies)
+    dedup.py                                Shared: duplicate detection, quarantine (music + movies + TV)
     video_scanner.py                  Movies: folder walking, ffprobe reads, filename parsing
     movie_matcher.py                    Movies: TMDB search + confidence scoring
-    movie_tagger.py                       Movies: rename, .nfo write, poster download, embed
+    movie_tagger.py                       Movies: rename, .nfo, poster, embed, shared ffmpeg remux
+    episode_scanner.py                TV: episode filename parsing (SxxEyy / NxNN / season folders)
+    tv_matcher.py                       TV: TMDB series + episode lookup, scoring
+    tv_tagger.py                          TV: episode/series .nfo, thumbnails, posters, rename
     config.py                               TMDB API key storage
-  app.py                    Thin Flask adapter over one MusicLibrary + one MovieLibrary
-  templates/index.html      Page shell (Music/Movies tabs)
+  app.py                    Thin Flask adapter over one MusicLibrary + MovieLibrary + TvLibrary
+  templates/index.html      Page shell (Music / Movies / TV Shows tabs)
   static/style.css            UI styling
-  static/app.js                  Frontend logic (fetch calls, rendering)
+  static/app.js                  Frontend logic (fetch calls, rendering, recovery panel)
   pyproject.toml            Packaging metadata (pip install -e . to use as a library)
   requirements.txt          Deps for running the web app (includes Flask)
   requirements-dev.txt      Adds pytest for running the test suite
@@ -324,11 +460,11 @@ metamatch/                (repo root)
   tests/                     See "Running the tests" below
 ```
 
-`app.py` only calls methods on `music_library`/`movie_library` (one
-`MusicLibrary`/`MovieLibrary` instance each) and translates the result to
-JSON — it holds no scan/match/apply/undo logic itself. Anything in
-`metamatch/` can be imported and used without app.py or Flask ever being
-involved; see "Using it as a library" above.
+`app.py` only calls methods on `music_library`/`movie_library`/`tv_library`
+(one instance of each) and translates the result to JSON — it holds no
+scan/match/apply/undo logic itself. Anything in `metamatch/` can be
+imported and used without app.py or Flask ever being involved; see "Using
+it as a library" above.
 
 ## Movie matching (TMDB)
 
@@ -390,8 +526,47 @@ they're organized are different:
   unrelated. Embedded-tag reverts are
   reliable for `.mp4`/`.m4v` (direct atom edit); for
   `.mkv`/`.avi`/`.mov`/`.wmv` the embed goes through an `ffmpeg` remux
-  that isn't cheaply reversible, so those tags are left as-is on undo -
-  the same tradeoff as music's cover-art embedding.
+  that isn't cheaply reversible — so if a later step of that apply fails,
+  the transaction is flagged `RECOVERY_REQUIRED` (the video still carries
+  the applied metadata) rather than falsely reported as rolled back.
+
+## TV matching (TMDB)
+
+TV shows use the same TMDB key as movies (click the **TV Shows** tab).
+Episodes are a messier matching problem than movies — a file carries a
+series name, a season, an episode number (sometimes several), and often an
+episode title, almost none of which is in the container tags — so TV
+leans hard on filename and folder structure:
+
+- **Parses episode filenames** across the common conventions:
+  `Show.Name.S01E02.Title.1080p.mkv`, `Show Name - 1x02 - Title.mkv`,
+  multi-episode files (`S01E02E03` → episodes 2 and 3), and a
+  `Show Name/Season 01/…` layout (it climbs past the `Season NN` folder to
+  find the real series name, and can even read a bare `E07.mkv` inside a
+  season folder). A file with no recognisable episode marker is left
+  unmatched rather than guessed at.
+- **Matches in two steps**: identify the series (TMDB `search/tv` on the
+  parsed show name), then fetch the specific episode for its real title,
+  air date, overview, and still image. A great series-name match to a show
+  that has no such episode number is penalised rather than confidently
+  accepted.
+- **Applies** the Plex/Kodi convention: a rename to
+  `Show Name - S01E02 - Episode Title.ext`, a Kodi/Jellyfin
+  `<episodedetails>` `.nfo` sidecar, and the episode still saved as
+  `<basename>-thumb.jpg`. Container-level tag embedding (`tvsh`/`tvsn`/
+  `tves`/`stik` MP4 atoms, or an `ffmpeg` remux for other formats) is
+  available too, off by default.
+- **Series-level metadata.** A separate **Write series metadata** action
+  writes the show-root artifacts a media server expects: a `<tvshow>`
+  `.nfo`, a series `poster.jpg`, and `seasonNN-poster.jpg` posters — one
+  journaled, rollback-protected transaction per series. "Undo all applied"
+  reverts both episode applies and series metadata.
+- Undo, duplicate detection, and quarantine work the same as music/movies,
+  with one TV-specific care: an apply writes several MP4 atoms
+  (`tvsh`/`tvsn`/`tves`/`stik`/`©ART`) beyond title/year, and undo restores
+  each atom to its *exact* prior value — deleting only atoms that didn't
+  exist before the apply, never blindly stripping pre-existing
+  show/season/episode tags a file already had.
 
 ## Running the tests
 
@@ -400,25 +575,34 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-304 tests covering both the music and movie sides: filename/tag parsing,
-match-scoring math, tag writing and cover-art/poster embedding, renaming,
-undo (including the "don't delete a sidecar that already existed"
-edge case), duplicate detection and quarantine, TMDB key storage, the
-`MusicLibrary`/`MovieLibrary` classes used directly (no Flask involved),
-and the full Flask route layer for both `/api/*` and `/api/movies/*`.
+418 tests covering all three media sides plus the safety subsystems:
+filename/tag parsing, match-scoring math, tag writing and
+cover-art/poster/thumbnail embedding, renaming, undo (including the
+"don't delete a sidecar that already existed" and "don't strip a
+pre-existing TV atom" edge cases), duplicate detection and quarantine,
+TMDB key storage, the `MusicLibrary`/`MovieLibrary`/`TvLibrary` classes
+used directly (no Flask involved), the full Flask route layer, the
+filesystem-authority gate, the journal/rollback state machine, an
+extensive fault-injection matrix (disk-full, killed ffmpeg, DB locks,
+journal corruption, process death at every boundary, journal-write
+failures), and the accumulated adversarial-review regressions
+(`test_review_020` through `test_review_023`), which permanently pin every
+security finding from successive review rounds.
 
 None of it touches the network — MusicBrainz, TMDB, and Cover Art
-Archive/poster lookups are all monkeypatched with fixtures in
-`tests/conftest.py` (`mock_music_match`, `mock_movie_match`,
-`mock_cover_art`, `mock_poster_download`), so the suite runs offline,
-fast (~4s), and without needing a TMDB API key.
+Archive/poster/thumbnail lookups are all monkeypatched with fixtures in
+`tests/conftest.py` (`mock_music_match`, `mock_movie_match`, `mock_tv_match`,
+`mock_cover_art`, `mock_poster_download`, `mock_thumb_download`,
+`mock_tv_series_details`), so the suite runs offline, fast, and without
+needing a TMDB API key.
 
 Real media files (mp3/wma/flac/mp4/mkv) are generated once per test
 session with `ffmpeg` and copied fresh into each test via the
-`music_dir`/`movie_dir` fixtures, so tag-writing and `ffprobe` reads are
-exercised against actual files, not mocks. Tests that need `ffmpeg` are
-marked `@requires_ffmpeg` and skip cleanly (rather than fail) if it isn't
-installed — run `pytest -v` to see which ones were skipped and why.
+`music_dir`/`movie_dir`/`tv_dir` fixtures, so tag-writing and `ffprobe`
+reads are exercised against actual files, not mocks. Tests that need
+`ffmpeg` are marked `@requires_ffmpeg` and skip cleanly (rather than fail)
+if it isn't installed — run `pytest -v` to see which ones were skipped and
+why.
 
 Config-touching tests use the `isolated_config` fixture, which redirects
 `metamatch/config.py` to a temp directory for the duration of the test, so
@@ -431,15 +615,23 @@ tests/
   test_matcher.py           MusicBrainz scoring math
   test_tagger.py               Tag writing, cover art, rename, undo helpers
   test_art.py                    Cover Art Archive fetch + cache
-  test_dedup.py                    Exact/probable duplicates, quarantine (both)
+  test_dedup.py                    Exact/probable duplicates, quarantine (all three)
   test_video_scanner.py    Movie filename parsing + ffprobe reading
   test_movie_matcher.py      TMDB scoring math
   test_movie_tagger.py         Rename, .nfo, poster, embedded metadata
-  test_config.py                 TMDB key storage
-  test_journal.py                  Persistent write-ahead journal, in isolation
-  test_fingerprint.py                Content-hash file identity, in isolation
-  test_library.py                    MusicLibrary/MovieLibrary used directly, no Flask
-  test_app_music.py                  Music Flask routes, end to end
-  test_app_movies.py                   Movie Flask routes, end to end
-  test_hardening.py                      Regressions for an adversarial security/robustness review
+  test_tv.py                       TV parsing, matching, apply/undo, series metadata, UI wiring
+  test_config.py                     TMDB key storage
+  test_journal.py                      Persistent write-ahead journal, in isolation
+  test_fingerprint.py                    Content-hash file identity, in isolation
+  test_library.py                          MusicLibrary/MovieLibrary/TvLibrary used directly, no Flask
+  test_app_music.py                          Music Flask routes, end to end
+  test_app_movies.py                           Movie Flask routes, end to end
+  test_rollback.py                               Automatic rollback / failure-atomic apply
+  test_fault_injection.py                          Disk-full, killed ffmpeg, DB locks, crash recovery, journal-write faults
+  test_recovery_resolve.py                           Recovery-item resolution workflow
+  test_hardening.py                                    Regressions for an adversarial security/robustness review
+  test_review_020.py                                     Adversarial round: rollback/atoms/concurrency/remux/sidecar findings
+  test_review_021.py                                       Adversarial round: mutation-time authority (symlink/hardlink/sidecar)
+  test_review_022.py                                         Adversarial round: restart-Undo authority via library_root provenance
+  test_review_023.py                                           Adversarial round: restart bulk-Undo scope
 ```
