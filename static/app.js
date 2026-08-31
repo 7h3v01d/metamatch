@@ -69,6 +69,22 @@ function tagLineHtml(track) {
   return `<div class="tag-line">${artist} &mdash; ${title}<br>${album}</div>`;
 }
 
+function ambiguityBadge(m) {
+  // Only worth flagging when the runner-up was close. A clear winner (low
+  // ambiguity) or a lone candidate (none) gets no badge - it would just be
+  // noise on the majority of rows.
+  if (!m || !m.ambiguity || m.ambiguity === "none" || m.ambiguity === "low") return "";
+  const ru = m.runner_up || {};
+  let label = ru.title || ru.series_name || "another candidate";
+  if (ru.artist) label += " — " + ru.artist;
+  else if (ru.year) label += " (" + ru.year + ")";
+  const marginTxt = (m.margin != null) ? ` · +${m.margin}% only` : "";
+  const cls = m.ambiguity === "high" ? "ambiguity-high" : "ambiguity-moderate";
+  const word = m.ambiguity === "high" ? "Close call" : "Close runner-up";
+  const tip = `2nd-best match: ${label}${ru.confidence != null ? " at " + ru.confidence + "%" : ""}`;
+  return `<div class="ambiguity ${cls}" title="${escapeHtml(tip)}">${word}: ${escapeHtml(label)}${marginTxt}</div>`;
+}
+
 function matchHtml(track) {
   if (!track.match) {
     return `<span class="no-match">not searched yet</span>`;
@@ -84,6 +100,7 @@ function matchHtml(track) {
         <div class="match-artist">${escapeHtml(m.artist || "Unknown artist")}</div>
         <div class="match-title">${escapeHtml(m.title || "Unknown title")}</div>
         <div class="match-album">${escapeHtml(m.album || "")}${m.date ? " · " + escapeHtml(m.date) : ""}</div>
+        ${ambiguityBadge(m)}
       </div>
     </div>
   `;
@@ -244,6 +261,11 @@ thresholdInput.addEventListener("input", () => {
   thresholdValue.textContent = thresholdInput.value + "%";
 });
 
+const marginInput = el("marginInput");
+marginInput.addEventListener("input", () => {
+  el("marginValue").textContent = marginInput.value === "0" ? "off" : "+" + marginInput.value + "%";
+});
+
 applyAllBtn.addEventListener("click", async () => {
   applyAllBtn.disabled = true;
   try {
@@ -255,6 +277,7 @@ applyAllBtn.addEventListener("click", async () => {
         rename: applyRenameCheck.checked,
         art: applyArtCheck.checked,
         min_confidence: parseFloat(thresholdInput.value),
+        min_margin: parseFloat(marginInput.value),
       }),
     });
     const data = await resp.json();
@@ -449,6 +472,7 @@ function movieMatchHtml(video) {
       <div class="match-text">
         <div class="match-artist">${escapeHtml(m.title || "Unknown title")}</div>
         <div class="match-title">${m.year ? escapeHtml(m.year) : ""}${m.vote_average ? " · ★ " + m.vote_average.toFixed(1) : ""}</div>
+        ${ambiguityBadge(m)}
       </div>
     </div>
   `;
@@ -616,6 +640,11 @@ movieThresholdInput.addEventListener("input", () => {
   movieThresholdValue.textContent = movieThresholdInput.value + "%";
 });
 
+const movieMarginInput = el("movieMarginInput");
+movieMarginInput.addEventListener("input", () => {
+  el("movieMarginValue").textContent = movieMarginInput.value === "0" ? "off" : "+" + movieMarginInput.value + "%";
+});
+
 movieApplyAllBtn.addEventListener("click", async () => {
   movieApplyAllBtn.disabled = true;
   try {
@@ -628,6 +657,7 @@ movieApplyAllBtn.addEventListener("click", async () => {
         nfo: movieNfoCheck.checked,
         poster: moviePosterCheck.checked,
         min_confidence: parseFloat(movieThresholdInput.value),
+        min_margin: parseFloat(movieMarginInput.value),
       }),
     });
     const data = await resp.json();
@@ -1102,6 +1132,7 @@ function tvMatchHtml(ep) {
       <div class="match-text">
         <div class="match-artist">${escapeHtml(m.series_name || "Unknown series")} · ${escapeHtml(epTag)}</div>
         <div class="match-title">${escapeHtml(title)}${m.vote_average ? " · ★ " + m.vote_average.toFixed(1) : ""}</div>
+        ${ambiguityBadge(m)}
       </div>
     </div>
   `;
@@ -1264,6 +1295,11 @@ tvThresholdInput.addEventListener("input", () => {
   tvThresholdValue.textContent = tvThresholdInput.value + "%";
 });
 
+const tvMarginInput = el("tvMarginInput");
+tvMarginInput.addEventListener("input", () => {
+  el("tvMarginValue").textContent = tvMarginInput.value === "0" ? "off" : "+" + tvMarginInput.value + "%";
+});
+
 tvApplyAllBtn.addEventListener("click", async () => {
   tvApplyAllBtn.disabled = true;
   try {
@@ -1276,6 +1312,7 @@ tvApplyAllBtn.addEventListener("click", async () => {
         nfo: tvNfoCheck.checked,
         thumb: tvThumbCheck.checked,
         min_confidence: parseFloat(tvThresholdInput.value),
+        min_margin: parseFloat(tvMarginInput.value),
       }),
     });
     const data = await resp.json();

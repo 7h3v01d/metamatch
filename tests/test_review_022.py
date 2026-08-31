@@ -18,7 +18,7 @@ import subprocess
 
 import pytest
 
-from conftest import requires_ffmpeg
+from conftest import requires_ffmpeg, requires_symlinks
 from metamatch.journal import Journal
 
 
@@ -82,6 +82,7 @@ class TestRestartUndoHardlinkAuthority:
         # outside file must be untouched (still the applied tags)
         assert EasyID3(str(victim)).get("artist") == ["MetaMatch"]
 
+    @requires_symlinks
     def test_restart_music_undo_refuses_symlinked_current_file(self, tmp_path):
         from metamatch import MusicLibrary
         import metamatch.matcher as matcher

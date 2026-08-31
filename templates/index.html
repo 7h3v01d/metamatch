@@ -95,6 +95,11 @@
         <input type="range" id="thresholdInput" min="0" max="100" value="80">
         <span id="thresholdValue">80%</span>
       </div>
+      <div class="threshold-field" title="Skip a bulk apply when the best match barely beats the runner-up (a near-tie), even if its confidence is high. 0 disables this check.">
+        <label for="marginInput">Min lead over 2nd</label>
+        <input type="range" id="marginInput" min="0" max="50" value="0">
+        <span id="marginValue">off</span>
+      </div>
       <label class="checkbox-field"><input type="checkbox" id="applyTagCheck" checked><span>Write tags</span></label>
       <label class="checkbox-field"><input type="checkbox" id="applyRenameCheck" checked><span>Rename files</span></label>
       <label class="checkbox-field"><input type="checkbox" id="applyArtCheck"><span>Embed cover art</span></label>
@@ -180,6 +185,11 @@
         <label for="movieThresholdInput">Auto-apply threshold</label>
         <input type="range" id="movieThresholdInput" min="0" max="100" value="80">
         <span id="movieThresholdValue">80%</span>
+      </div>
+      <div class="threshold-field" title="Skip a bulk apply when the best match barely beats the runner-up (a near-tie), even if its confidence is high. 0 disables this check.">
+        <label for="movieMarginInput">Min lead over 2nd</label>
+        <input type="range" id="movieMarginInput" min="0" max="50" value="0">
+        <span id="movieMarginValue">off</span>
       </div>
       <label class="checkbox-field"><input type="checkbox" id="movieRenameCheck" checked><span>Rename files</span></label>
       <label class="checkbox-field"><input type="checkbox" id="movieNfoCheck" checked><span>Write .nfo</span></label>
@@ -267,6 +277,11 @@
         <label for="tvThresholdInput">Auto-apply threshold</label>
         <input type="range" id="tvThresholdInput" min="0" max="100" value="80">
         <span id="tvThresholdValue">80%</span>
+      </div>
+      <div class="threshold-field" title="Skip a bulk apply when the best match barely beats the runner-up (a near-tie), even if its confidence is high. 0 disables this check.">
+        <label for="tvMarginInput">Min lead over 2nd</label>
+        <input type="range" id="tvMarginInput" min="0" max="50" value="0">
+        <span id="tvMarginValue">off</span>
       </div>
       <label class="checkbox-field"><input type="checkbox" id="tvRenameCheck" checked><span>Rename files</span></label>
       <label class="checkbox-field"><input type="checkbox" id="tvNfoCheck" checked><span>Write .nfo</span></label>

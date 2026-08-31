@@ -332,6 +332,7 @@ def api_apply_all():
             do_rename=bool(data.get("rename", True)),
             do_art=bool(data.get("art", False)),
             min_confidence=float(data.get("min_confidence", 75)),
+            min_margin=float(data.get("min_margin", 0)),
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -481,6 +482,7 @@ def api_movies_apply_all():
             do_nfo=bool(data.get("nfo", True)),
             do_poster=bool(data.get("poster", True)),
             min_confidence=float(data.get("min_confidence", 75)),
+            min_margin=float(data.get("min_margin", 0)),
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -607,6 +609,7 @@ def api_tv_apply_all():
             do_nfo=bool(data.get("nfo", True)),
             do_thumb=bool(data.get("thumb", True)),
             min_confidence=float(data.get("min_confidence", 75)),
+            min_margin=float(data.get("min_margin", 0)),
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 400

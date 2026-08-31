@@ -31,6 +31,33 @@ FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 requires_ffmpeg = pytest.mark.skipif(not FFMPEG_AVAILABLE, reason="ffmpeg not installed on this machine")
 
 
+def _symlinks_supported() -> bool:
+    """Whether this process can actually create a symlink. On Windows this
+    needs admin rights or Developer Mode (otherwise os.symlink raises
+    WinError 1314). Tests that reproduce symlink-authority attacks need to
+    CREATE a symlink to set up the scenario, so they skip cleanly where the
+    OS won't allow it rather than erroring - the product code being tested
+    still runs everywhere; only the adversarial test setup needs the privilege."""
+    import tempfile
+    d = tempfile.mkdtemp()
+    target = os.path.join(d, "t"); link = os.path.join(d, "l")
+    try:
+        with open(target, "w") as f:
+            f.write("x")
+        os.symlink(target, link)
+        return True
+    except (OSError, NotImplementedError, AttributeError):
+        return False
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+SYMLINKS_SUPPORTED = _symlinks_supported()
+requires_symlinks = pytest.mark.skipif(
+    not SYMLINKS_SUPPORTED,
+    reason="creating symlinks isn't permitted here (Windows needs admin/Developer Mode)")
+
+
 # ---------------------------------------------------------------------------
 # Media fixture generation (session-scoped: built once, copied per test)
 # ---------------------------------------------------------------------------
@@ -156,6 +183,7 @@ def make_fake_music_match(**overrides) -> dict:
         "date": "1997-01-01", "length_ms": 200000, "mb_score": 95,
         "title_similarity": 95, "artist_similarity": 95, "duration_similarity": 90,
         "confidence": 92.5, "musicbrainz_url": "https://musicbrainz.org/recording/rec-1",
+        "margin": None, "ambiguity": "none", "runner_up": None,
     }
     base.update(overrides)
     return base
@@ -169,6 +197,7 @@ def make_fake_movie_match(**overrides) -> dict:
         "poster_url": "https://image.tmdb.org/t/p/w342/poster.jpg",
         "poster_url_full": "https://image.tmdb.org/t/p/original/poster.jpg",
         "title_similarity": 95, "year_similarity": 100, "confidence": 92.0,
+        "margin": None, "ambiguity": "none", "runner_up": None,
         "tmdb_url": "https://www.themoviedb.org/movie/603",
     }
     base.update(overrides)
@@ -323,6 +352,7 @@ def make_fake_tv_match(**overrides) -> dict:
         "still_url_full": "https://image.tmdb.org/t/p/original/still.jpg",
         "name_similarity": 95.0,
         "confidence": 96.0,
+        "margin": None, "ambiguity": "none", "runner_up": None,
         "tmdb_url": "https://www.themoviedb.org/tv/1396/season/1/episode/2",
     }
     base.update(overrides)

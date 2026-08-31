@@ -171,6 +171,36 @@ def _validate_confidence(min_confidence: float) -> float:
     return value
 
 
+def _validate_margin(min_margin: float) -> float:
+    """Same NaN/range guard as confidence, for the auto-apply margin floor. A
+    non-finite margin would make `margin < nan` always False and silently
+    disable the ambiguity gate."""
+    try:
+        value = float(min_margin)
+    except (TypeError, ValueError):
+        raise ValueError(f"min_margin must be a number, got {min_margin!r}")
+    if not math.isfinite(value):
+        raise ValueError(f"min_margin must be a finite number, got {min_margin!r}")
+    if not (0 <= value <= 100):
+        raise ValueError(f"min_margin must be between 0 and 100, got {value}")
+    return value
+
+
+def _passes_apply_thresholds(match: Optional[dict], min_confidence: float, min_margin: float) -> bool:
+    """Whether a match clears the bulk-apply bar: confidence at or above
+    min_confidence AND, when min_margin is set, a clear-enough lead over the
+    runner-up. A match with no runner-up (margin is None - only one candidate
+    was found) is NOT ambiguous, so it passes any margin requirement; the
+    margin gate only rejects genuine near-ties."""
+    if not match or match.get("confidence", 0) < min_confidence:
+        return False
+    if min_margin > 0:
+        margin = match.get("margin")
+        if margin is not None and margin < min_margin:
+            return False
+    return True
+
+
 def _read_small_file(path: str, max_bytes: int) -> Optional[bytes]:
     """Reads a file's full contents if it exists and isn't larger than max_bytes, else None."""
     try:
@@ -692,15 +722,16 @@ class MusicLibrary:
             return self._apply_one(track, do_tag, do_rename, do_art)
 
     def apply_all(self, do_tag: bool = True, do_rename: bool = True, do_art: bool = False,
-                  min_confidence: float = 75.0) -> dict:
+                  min_confidence: float = 75.0, min_margin: float = 0.0) -> dict:
         """Applies every scanned track whose match confidence is at or above min_confidence."""
         min_confidence = _validate_confidence(min_confidence)
+        min_margin = _validate_margin(min_margin)
         with self._lock:
             candidates = [self.tracks[p] for p in self.order]
 
         results = []
         for track in candidates:
-            if not track.match or track.match.get("confidence", 0) < min_confidence:
+            if not _passes_apply_thresholds(track.match, min_confidence, min_margin):
                 continue
             with self._mutation_locks.get(track.path):
                 results.append(self._apply_one(track, do_tag, do_rename, do_art))
@@ -1109,14 +1140,15 @@ class MovieLibrary:
             return self._apply_one(video, do_tag, do_rename, do_nfo, do_poster)
 
     def apply_all(self, do_tag: bool = False, do_rename: bool = True, do_nfo: bool = True,
-                  do_poster: bool = True, min_confidence: float = 75.0) -> dict:
+                  do_poster: bool = True, min_confidence: float = 75.0, min_margin: float = 0.0) -> dict:
         min_confidence = _validate_confidence(min_confidence)
+        min_margin = _validate_margin(min_margin)
         with self._lock:
             candidates = [self.videos[p] for p in self.order]
 
         results = []
         for video in candidates:
-            if not video.match or video.match.get("confidence", 0) < min_confidence:
+            if not _passes_apply_thresholds(video.match, min_confidence, min_margin):
                 continue
             with self._mutation_locks.get(video.path):
                 results.append(self._apply_one(video, do_tag, do_rename, do_nfo, do_poster))
@@ -1684,14 +1716,15 @@ class TvLibrary:
             return self._apply_one(episode, do_tag, do_rename, do_nfo, do_thumb)
 
     def apply_all(self, do_tag: bool = False, do_rename: bool = True, do_nfo: bool = True,
-                  do_thumb: bool = True, min_confidence: float = 75.0) -> dict:
+                  do_thumb: bool = True, min_confidence: float = 75.0, min_margin: float = 0.0) -> dict:
         min_confidence = _validate_confidence(min_confidence)
+        min_margin = _validate_margin(min_margin)
         with self._lock:
             candidates = [self.episodes[p] for p in self.order]
 
         results = []
         for episode in candidates:
-            if not episode.match or episode.match.get("confidence", 0) < min_confidence:
+            if not _passes_apply_thresholds(episode.match, min_confidence, min_margin):
                 continue
             with self._mutation_locks.get(episode.path):
                 results.append(self._apply_one(episode, do_tag, do_rename, do_nfo, do_thumb))

@@ -15,6 +15,8 @@ from typing import Optional
 import requests
 from rapidfuzz import fuzz
 
+from . import scoring
+
 from .config import get_tmdb_api_key
 
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
@@ -157,7 +159,8 @@ def find_best_match(video) -> Optional[dict]:
 
     scored = [score_candidate(video, c, rank=i) for i, c in enumerate(candidates)]
     scored.sort(key=lambda s: s["confidence"], reverse=True)
-    return scored[0]
+    return scoring.annotate_winner(
+        scored, scored[0], label_fields=("title", "year"))
 
 
 def match_videos(videos: list, progress_callback=None) -> None:

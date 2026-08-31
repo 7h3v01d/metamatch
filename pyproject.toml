@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metamatch"
-version = "0.2.4"
+version = "0.3.1"
 description = "Match local music, movie, and TV files against MusicBrainz/TMDB and reconcile tags, filenames, artwork, sidecars, and duplicates."
 readme = "README.md"
 requires-python = ">=3.10"

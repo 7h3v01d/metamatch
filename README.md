@@ -1,8 +1,9 @@
 # MetaMatch
 
-*Version 0.2.4 · Apache-2.0 · by Leon Priest. A local, single-user desktop
+*Version 0.3.1 · Apache-2.0 · by Leon Priest. A local, single-user desktop
 tool — no telemetry, no account, no cloud; the only network calls are the
-metadata lookups you trigger (MusicBrainz / TMDB / Cover Art Archive).*
+metadata lookups you trigger (MusicBrainz / TMDB / Cover Art Archive).
+(0.2.4 was the adversarially-reviewed freeze baseline; 0.3.0 builds on it.)*
 
 A local tool that scans your media folder, reads whatever tags/filenames it
 has, looks each item up against an online database, and shows you a
@@ -51,12 +52,19 @@ crash recovery" below.
   - MusicBrainz's own relevance score
   - duration closeness (when both durations are known)
   
-  These are blended into a single 0–100 **confidence score**.
+  These are blended into a single 0–100 **confidence score**. MetaMatch also
+  keeps the **runner-up** and the **margin** between first and second place,
+  so you can tell a confident identification (93% with a 40-point lead) from
+  a near-tie (93% with a 2-point lead) — the UI flags the latter with a
+  "Close call" badge, and bulk apply can require a minimum lead (see below).
 - **Applies matches** you approve: write corrected artist/title/album/year
   tags back into the file, rename it to `Artist - Title.ext`, embed cover
   art, or any combination of the three.
 - **Bulk apply** everything at or above a confidence threshold you set with
-  a slider, or export a CSV report instead of touching any files.
+  a slider — optionally also requiring a minimum *margin* over the runner-up,
+  so a high-confidence-but-ambiguous near-tie is held back for a human look
+  rather than auto-applied — or export a CSV report instead of touching any
+  files.
 - **Undo** any applied change, one file or all of them, restoring the
   original tags and filename.
 - **Cover art**, fetched from the Cover Art Archive (MusicBrainz's
@@ -113,7 +121,9 @@ for track in lib.tracks_payload():
     elif match:
         print(f"Low confidence ({match['confidence']}%) for {track['filename']}, skipping")
 
-lib.apply_all(min_confidence=90)    # or apply everything above a bar in one call
+# apply everything above a confidence bar in one call; add min_margin to also
+# skip near-ties (winner must beat the runner-up by at least that many points)
+lib.apply_all(min_confidence=90, min_margin=10)
 dupes = lib.find_duplicates()       # {"exact": [...], "probable": [...]}
 csv_text = lib.export_csv()
 ```
@@ -182,11 +192,16 @@ movies, `.nfo`/thumbnail/series-metadata for TV).
    so a library of a few hundred tracks will take a few minutes; progress
    is shown live.
 3. Review the table: current tags on the left, best MusicBrainz match and
-   confidence bar on the right.
+   confidence bar on the right. A **"Close call"** badge appears on any row
+   where the second-best candidate was nearly as good, so you can spot the
+   matches worth eyeballing before applying.
    - Click **Apply** on a single row to tag/rename just that file.
    - Or set the **auto-apply threshold** slider and click **Apply to
      matches ≥ threshold** to process everything above that confidence in
-     one go.
+     one go. The **Min lead over 2nd** slider next to it (off by default)
+     additionally skips near-ties — a match only auto-applies if it also
+     beats its runner-up by at least that many points — so a
+     high-confidence-but-ambiguous guess waits for you instead.
    - Toggle **Write tags** / **Rename files** / **Embed cover art**
      independently — e.g. leave rename off if you only want tags corrected
      in place.
@@ -437,6 +452,7 @@ metamatch/                (repo root)
     journal.py                      Persistent write-ahead undo/crash-recovery log (SQLite) + state machine
     pathsafe.py                       Filesystem-authority gate: link/reparse/hard-link/containment checks
     fingerprint.py                    Content-hash file identity (defeats size+mtime-only staleness checks)
+    scoring.py                        Match-ambiguity: runner-up + margin + ambiguity label, shared by all matchers
     scanner.py                      Music: folder walking, tag reading, filename parsing
     matcher.py                        Music: MusicBrainz search + confidence scoring
     tagger.py                           Music: tag writing, cover art embedding, renaming
@@ -575,7 +591,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-418 tests covering all three media sides plus the safety subsystems:
+437 tests covering all three media sides plus the safety subsystems:
 filename/tag parsing, match-scoring math, tag writing and
 cover-art/poster/thumbnail embedding, renaming, undo (including the
 "don't delete a sidecar that already existed" and "don't strip a
@@ -623,6 +639,8 @@ tests/
   test_config.py                     TMDB key storage
   test_journal.py                      Persistent write-ahead journal, in isolation
   test_fingerprint.py                    Content-hash file identity, in isolation
+  test_pathsafe.py                         Filesystem-authority primitives (incl. cross-platform link handling)
+  test_ambiguity.py                        Runner-up/margin model + auto-apply margin gate
   test_library.py                          MusicLibrary/MovieLibrary/TvLibrary used directly, no Flask
   test_app_music.py                          Music Flask routes, end to end
   test_app_movies.py                           Movie Flask routes, end to end

@@ -43,17 +43,24 @@ def _contains(root_real: str, target_real: str) -> bool:
 
 
 def is_link_or_reparse(path: str) -> bool:
-    """True if `path` is a symlink or (on Windows) any reparse point. Also
-    True if the path can't be lstat'd at all - we fail closed, treating an
-    unstattable entry as unsafe rather than admitting it."""
+    """True if `path` is a symlink or (on Windows) any reparse point. A path
+    that does not exist is NOT a link - it's absent, and absent means safe to
+    create - so this returns False for a missing path. An existing path that
+    can't be lstat'd (a permission error, say) fails closed to True.
+
+    The lexists() guard on the Windows branch matters: os.lstat() on a missing
+    path raises FileNotFoundError, and treating that as "unsafe" would make
+    MetaMatch refuse to CREATE any new sidecar on Windows (the file we're about
+    to write doesn't exist yet by definition)."""
     try:
         if os.path.islink(path):
             return True
-        if os.name == "nt":
+        if os.name == "nt" and os.path.lexists(path):
             attrs = getattr(os.lstat(path), "st_file_attributes", 0)
             if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
                 return True
     except OSError:
+        # An existing path we genuinely can't inspect - fail closed.
         return True
     return False
 

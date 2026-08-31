@@ -20,7 +20,7 @@ import subprocess
 
 import pytest
 
-from conftest import requires_ffmpeg
+from conftest import requires_ffmpeg, requires_symlinks
 from metamatch.journal import Journal
 
 
@@ -35,6 +35,7 @@ def _mp3(path, freq=440):
 # --------------------------------------------------------------------------
 
 @requires_ffmpeg
+@requires_symlinks
 class TestPostScanSymlinkSwap:
     def test_scanned_file_replaced_by_symlink_is_refused(self, tmp_path):
         from metamatch import MusicLibrary
@@ -72,6 +73,7 @@ class TestPostScanSymlinkSwap:
 # --------------------------------------------------------------------------
 
 @requires_ffmpeg
+@requires_symlinks
 class TestSidecarSymlink:
     def test_nfo_symlink_is_not_followed(self, tmp_path, media_fixtures_dir, mock_movie_match):
         from metamatch import MovieLibrary
@@ -137,6 +139,7 @@ class TestHardLinkAlias:
 # --------------------------------------------------------------------------
 
 @requires_ffmpeg
+@requires_symlinks
 class TestSeriesRootSwap:
     def test_series_root_symlink_is_refused(self, tmp_path, media_fixtures_dir, mock_tv_match, mock_tv_series_details):
         from metamatch import TvLibrary

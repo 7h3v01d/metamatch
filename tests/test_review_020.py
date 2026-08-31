@@ -20,7 +20,7 @@ import threading
 
 import pytest
 
-from conftest import requires_ffmpeg
+from conftest import requires_ffmpeg, requires_symlinks
 from metamatch.journal import Journal, RECOVERY_REQUIRED, ROLLED_BACK
 
 
@@ -35,6 +35,7 @@ def _make_mp3(path):
 # --------------------------------------------------------------------------
 
 @requires_ffmpeg
+@requires_symlinks
 class TestSymlinkAuthorityBoundary:
     def _setup(self, tmp_path):
         lib = tmp_path / "Library"; lib.mkdir()

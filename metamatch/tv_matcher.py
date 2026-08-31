@@ -21,6 +21,7 @@ from typing import Optional
 import requests
 from rapidfuzz import fuzz
 
+from . import scoring
 from .config import get_tmdb_api_key
 from .movie_matcher import TmdbNotConfigured, _throttle, TMDB_IMAGE_BASE
 
@@ -148,20 +149,27 @@ def find_best_match(episode_file) -> Optional[dict]:
     scored = [score_series(episode_file, c, rank=i) for i, c in enumerate(candidates)]
     scored.sort(key=lambda s: s["series_confidence"], reverse=True)
 
+    # Series identity is the ambiguity that matters for TV - "which show is
+    # this" - so the margin/runner-up describe the series contest.
+    def _annotated(match):
+        return scoring.annotate_winner(
+            scored, match, confidence_key="series_confidence",
+            label_fields=("series_name", "series_year"))
+
     # Walk candidates best-first, taking the first whose claimed episode
     # actually exists. If none do, fall back to the top series with a
     # confidence penalty (we found the show but not the episode).
     for series in scored:
         ep = _tmdb_episode(series["series_tmdb_id"], episode_file.season, episode_file.episode)
         if ep is not None:
-            return _build_match(episode_file, series, ep)
+            return _annotated(_build_match(episode_file, series, ep))
 
     top = scored[0]
     fallback = _build_match(episode_file, top, {})
     fallback["episode_title"] = None
     fallback["confidence"] = round(top["series_confidence"] * 0.5, 1)
     fallback["episode_missing"] = True
-    return fallback
+    return _annotated(fallback)
 
 
 def match_episodes(episodes: list, progress_callback=None) -> None:

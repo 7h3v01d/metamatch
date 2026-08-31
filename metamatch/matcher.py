@@ -18,6 +18,8 @@ from typing import Optional
 import requests
 from rapidfuzz import fuzz
 
+from . import scoring
+
 MB_SEARCH_URL = "https://musicbrainz.org/ws/2/recording/"
 USER_AGENT = "MetaMatch/1.0 ( https://example.local/metamatch )"
 
@@ -165,7 +167,8 @@ def find_best_match(track) -> Optional[dict]:
 
     scored = [score_candidate(track, c) for c in candidates]
     scored.sort(key=lambda s: s["confidence"], reverse=True)
-    return scored[0]
+    return scoring.annotate_winner(
+        scored, scored[0], label_fields=("title", "artist", "album"))
 
 
 def match_tracks(tracks: list, progress_callback=None) -> None:
